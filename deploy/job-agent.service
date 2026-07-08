@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Job Agent — Web Dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/venv-jobagent/bin/python /opt/baal-agent/workspace/job-agent/app.py
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/opt/baal-agent/workspace/job-agent
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

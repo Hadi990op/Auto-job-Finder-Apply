@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Runtime data
+src/data/jobagent.db
+src/data/whatsapp/session/
+src/data/whatsapp/*.png
+src/data/cvs/*
+
+# Keep these (empty dirs with .gitkeep)
+!src/data/cvs/.gitkeep
+!src/data/whatsapp/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

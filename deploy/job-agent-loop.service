@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Job Agent — Autonomous Loop
+After=network.target job-agent.service
+
+[Service]
+Type=simple
+ExecStart=/opt/venv-jobagent/bin/python /opt/baal-agent/workspace/job-agent/agent.py --loop 6
+Restart=on-failure
+RestartSec=30
+WorkingDirectory=/opt/baal-agent/workspace/job-agent
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
