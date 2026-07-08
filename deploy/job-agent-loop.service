@@ -1,10 +1,10 @@
 [Unit]
-Description=AI Job Agent — Autonomous Loop
+Description=AI Job Agent — Real-Time Monitor
 After=network.target job-agent.service
 
 [Service]
 Type=simple
-ExecStart=/opt/venv-jobagent/bin/python /opt/baal-agent/workspace/job-agent/agent.py --loop 6
+ExecStart=/opt/venv-jobagent/bin/python /opt/baal-agent/workspace/job-agent/agent.py --loop 2
 Restart=on-failure
 RestartSec=30
 WorkingDirectory=/opt/baal-agent/workspace/job-agent

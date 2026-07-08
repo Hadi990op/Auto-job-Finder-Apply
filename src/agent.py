@@ -366,23 +366,66 @@ def evaluate_job_smart(job: dict, profile: dict, use_ai: bool = True) -> Evaluat
 
 
 def capture_application_proof(app_id: int, job_url: str) -> Optional[str]:
-    """Capture a screenshot of the job page as proof of application."""
+    """Capture a screenshot of the job page as proof of application.
+    
+    Uses a robust approach with short timeouts and error recovery.
+    Even if the page is heavy or blocks automation, we still try to capture
+    what we can — a partial screenshot is better than no proof.
+    """
     if not job_url or not job_url.startswith("http"):
         return None
 
     proof_dir = DATA_DIR / "proofs"
     proof_dir.mkdir(exist_ok=True)
     screenshot_path = proof_dir / f"app_{app_id}.png"
+    
+    # Auto-cleanup: keep only the last 200 screenshots to save disk space
+    try:
+        existing = sorted(proof_dir.glob("app_*.png"))
+        if len(existing) > 200:
+            for old_file in existing[:-200]:
+                old_file.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
             page = browser.new_page(viewport={"width": 1280, "height": 900})
-            page.goto(job_url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)  # Let page settle
-            page.screenshot(path=str(screenshot_path), full_page=False)
-            page_title = page.title()
+            
+            # Short timeout — if page doesn't load in 15s, take what we have
+            try:
+                page.goto(job_url, timeout=15000, wait_until="domcontentloaded")
+            except Exception:
+                pass  # Page may have partially loaded — try screenshot anyway
+            
+            # Wait just 1 second for page to settle (not 2 — faster)
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+            
+            page_title = ""
+            try:
+                page_title = page.title()
+            except Exception:
+                page_title = "Unknown (page crashed)"
+            
+            try:
+                page.screenshot(path=str(screenshot_path), full_page=False, timeout=10000)
+            except Exception:
+                # Try viewport-only screenshot as fallback
+                try:
+                    page.screenshot(path=str(screenshot_path), full_page=False, timeout=5000)
+                except Exception:
+                    browser.close()
+                    return None
+            
             browser.close()
+
+        # Verify the screenshot was actually saved
+        if not screenshot_path.exists():
+            return None
 
         # Store in database
         db = get_db()
@@ -545,22 +588,15 @@ def notify(event: str, details: str, level: str = "info"):
 
 def run_agent_cycle():
     """
-    Run one complete cycle of the autonomous agent:
-    1. Check profile is set up
-    2. Discover jobs from all sources
-    3. Evaluate each job
-    4. Auto-apply to matching jobs
-    5. Send notifications
-    6. Update agent state
+    Run one monitoring cycle — check all sources for NEW jobs.
+    If a new matching job is found, apply IMMEDIATELY (don't wait).
+    
+    This is a real-time monitor, not a batch job. It runs every 2-3 minutes
+    so the agent is among the FIRST to apply to new postings.
     """
-    print("=" * 60)
-    print(f"[AGENT] Cycle started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-
     profile = get_profile()
     if not profile:
         log_activity("agent_cycle", "No profile set up. Skipping cycle.", level="warning")
-        print("[AGENT] No profile set up. Skipping.")
         return {"error": "no_profile"}
 
     update_agent_state({"running": 1, "last_run": datetime.now().isoformat()})
@@ -569,27 +605,36 @@ def run_agent_cycle():
     max_per_source = config.get("max_per_source", 30)
     auto_apply_threshold = profile.get("auto_apply_threshold", 50)
     max_applications_per_cycle = config.get("max_applications_per_cycle", 10)
-    max_age_days = config.get("max_age_days", 2)  # Only catch jobs from last 2 days
+    max_age_days = config.get("max_age_days", 1)  # Default: only last 1 day (real-time!)
 
-    # 1. DISCOVER
-    print("\n[1/5] DISCOVERING JOBS...")
-    log_activity("discover_start", f"Scraping all job sources (jobs from last {max_age_days} days only)")
+    # 1. DISCOVER — check all sources for fresh jobs
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scanning all sources...")
+    log_activity("scan_start", f"Scanning all job sources (jobs from last {max_age_days} day(s) only)")
     try:
         jobs = scrape_all_jobs(profile, max_per_source=max_per_source, max_age_days=max_age_days)
     except Exception as e:
         log_activity("discover_error", str(e), level="error")
+        update_agent_state({"running": 0})
         return {"error": str(e)}
 
-    # Filter out already-seen jobs
+    # Filter out already-seen jobs — only NEW postings matter
     db = get_db()
     seen_ids = {row["id"] for row in db.execute("SELECT id FROM seen_jobs").fetchall()}
     db.close()
 
     new_jobs = [j for j in jobs if j.id not in seen_ids]
-    print(f"  Discovered {len(jobs)} jobs ({len(new_jobs)} new, {len(jobs) - len(new_jobs)} already seen)")
 
-    # 2. EVALUATE
-    print(f"\n[2/5] EVALUATING {len(new_jobs)} NEW JOBS...")
+    if not new_jobs:
+        print(f"  [{datetime.now().strftime('%H:%M:%S')}] No new jobs ({len(jobs)} already seen)")
+        update_agent_state({
+            "running": 0,
+            "next_run": (datetime.now() + timedelta(minutes=config.get("run_interval_hours", 0.05) * 60)).isoformat()
+        })
+        return {"discovered": len(jobs), "new": 0, "applied": 0, "notified": 0}
+
+    print(f"  [{datetime.now().strftime('%H:%M:%S')}] Found {len(new_jobs)} NEW job(s)! Evaluating...")
+
+    # 2. EVALUATE + APPLY — process each new job immediately
     applied_count = 0
     notified_count = 0
 
@@ -602,18 +647,17 @@ def run_agent_cycle():
                 job.description = detail
             time.sleep(1)
 
-        # Fast keyword-based evaluation (no AI, no rate limits)
-        # AI is reserved for CV/cover letter generation during auto-apply
+        # Fast keyword-based evaluation (no AI — saves API calls for CV generation)
         evaluation = evaluate_job(job.to_dict(), profile)
         store_job(job, evaluation)
 
-        # 3. AUTO-APPLY
+        # 3. AUTO-APPLY IMMEDIATELY if it matches
         if evaluation.should_auto_apply and applied_count < max_applications_per_cycle:
-            print(f"\n[3/5] AUTO-APPLYING: {job.title} at {job.company} (score: {evaluation.overall_score})")
+            print(f"  >>> APPLYING NOW: {job.title} at {job.company} (score: {evaluation.overall_score})")
             result = auto_apply_to_job(job.to_dict(), profile, evaluation)
             applied_count += 1
 
-            # 4. NOTIFY
+            # 4. NOTIFY immediately
             notify_msg = (
                 f"Applied to: {job.title} at {job.company}\n"
                 f"  Score: {evaluation.overall_score}/100 ({evaluation.verdict})\n"
@@ -623,29 +667,26 @@ def run_agent_cycle():
             )
             notify("job_applied", notify_msg)
             notified_count += 1
-
-            # Be gentle — don't apply to too many at once
-            time.sleep(2)
         else:
             if not evaluation.should_auto_apply:
                 mark_job_status(job.id, "evaluated")
 
     # 5. UPDATE STATE
-    print(f"\n[5/5] CYCLE COMPLETE")
     summary = (
-        f"Discovered: {len(jobs)} | New: {len(new_jobs)} | "
+        f"Scanned: {len(jobs)} | New: {len(new_jobs)} | "
         f"Applied: {applied_count} | Notified: {notified_count}"
     )
     print(f"  {summary}")
 
     state = get_agent_state()
+    interval_min = config.get("run_interval_hours", 0.05) * 60  # convert hours to minutes
     update_agent_state({
         "running": 0,
         "total_discovered": state.get("total_discovered", 0) + len(jobs),
         "total_evaluated": state.get("total_evaluated", 0) + len(new_jobs),
         "total_applied": state.get("total_applied", 0) + applied_count,
         "total_notified": state.get("total_notified", 0) + notified_count,
-        "next_run": (datetime.now() + timedelta(hours=config.get("run_interval_hours", 4))).isoformat()
+        "next_run": (datetime.now() + timedelta(minutes=interval_min)).isoformat()
     })
 
     log_activity("agent_cycle_complete", summary)
@@ -658,9 +699,17 @@ def run_agent_cycle():
     }
 
 
-def run_agent_loop(interval_hours: float = 4):
-    """Run the agent in a continuous loop."""
-    print(f"[AGENT] Starting continuous loop (interval: {interval_hours}h)")
+def run_agent_loop(interval_minutes: float = 2):
+    """
+    Run the agent as a REAL-TIME MONITOR.
+    Checks all job sources every `interval_minutes` minutes (default: 2).
+    When a new matching job is found, it applies IMMEDIATELY — no waiting.
+    
+    This ensures the agent is among the FIRST to apply to new postings,
+    giving a huge advantage over candidates who apply hours later.
+    """
+    print(f"[AGENT] Starting REAL-TIME MONITOR (checking every {interval_minutes} min)")
+    print(f"[AGENT] New matching jobs will be applied to INSTANTLY")
 
     init_db()
 
@@ -669,24 +718,27 @@ def run_agent_loop(interval_hours: float = 4):
             run_agent_cycle()
         except Exception as e:
             log_activity("agent_error", str(e), level="error")
-            print(f"[AGENT] Error in cycle: {e}")
+            print(f"[AGENT] Error: {e}")
 
-        print(f"\n[AGENT] Sleeping for {interval_hours} hours...")
-        time.sleep(interval_hours * 3600)
+        print(f"  Next scan in {interval_minutes} minutes...")
+        time.sleep(interval_minutes * 60)
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        # Run a single cycle
+        # Run a single scan cycle
         init_db()
         result = run_agent_cycle()
         print(json.dumps(result, indent=2))
     elif len(sys.argv) > 1 and sys.argv[1] == "--loop":
-        # Run continuous loop
-        interval = float(sys.argv[2]) if len(sys.argv) > 2 else 4
+        # Run real-time monitor (interval in minutes, default 2)
+        interval = float(sys.argv[2]) if len(sys.argv) > 2 else 2
         run_agent_loop(interval)
     else:
-        print("Usage: python agent.py [--once | --loop <hours>]")
-        print("  --once   Run a single discovery+apply cycle")
-        print("  --loop N Run continuously, repeating every N hours (default: 4)")
+        print("Usage: python agent.py [--once | --loop <minutes>]")
+        print("  --once         Run a single scan cycle")
+        print("  --loop N       Run real-time monitor, checking every N minutes (default: 2)")
+        print("")
+        print("The agent checks all job sources every N minutes.")
+        print("When a new matching job is found, it applies IMMEDIATELY.")

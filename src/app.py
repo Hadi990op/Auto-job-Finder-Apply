@@ -195,11 +195,12 @@ async def dashboard():
 {nav('home')}
 <div class="container">
 <h1>AI Job Agent</h1>
-<p class="subtitle">Autonomous agent — finds jobs, evaluates with AI, generates CV/cover letters with AI, auto-applies, and notifies you on WhatsApp</p>
+<p class="subtitle">Real-time autonomous agent — monitors job sources every 2 minutes, generates AI-powered CV/cover letters, and applies INSTANTLY when a matching job is posted</p>
 
 <div style="display:flex;gap:20px;margin-bottom:20px;font-size:13px">
 <span>{ai_badge}</span>
 <span>{wa_badge}</span>
+<span><span style="color:#6ee7b7">●</span> Real-Time Monitor (2 min)</span>
 </div>
 
 {f"<div class='alert'>⚠️ Profile not set up. <a href='{BASE}/profile' class='btn' style='padding:5px 12px;font-size:12px'>Set up profile →</a></div>" if not has_p else ""}
@@ -214,7 +215,7 @@ async def dashboard():
 
 <div class="section">
 <h2>Agent Control</h2>
-<p style="color:#64748b;margin-bottom:15px">Run the agent now to discover new jobs and auto-apply to matches.</p>
+<p style="color:#64748b;margin-bottom:15px">The agent monitors all job sources every 2 minutes. When a new matching job is posted, it applies <strong>instantly</strong> — no waiting. You can also trigger a manual scan now.</p>
 <div id="run-result"></div>
 <button class="btn btn-green" onclick="runAgent()" id="run-btn">▶ Run Agent Now</button>
 <a href="{BASE}/config" class="btn btn-sec">⚙ Configure</a>
@@ -397,14 +398,17 @@ async def config_page():
 <div class="section">
 <h2>Agent Settings</h2>
 <form method="POST" action="{BASE}/config">
-<label>Run Interval (hours)</label>
-<input name="run_interval_hours" type="number" step="0.5" min="0.5" value="{config.get('run_interval_hours',4)}" placeholder="4">
-<div style="color:#475569;font-size:11px;margin-top:3px">How often the agent runs automatically (when running as a service)</div>
+<label>Scan Interval (minutes)</label>
+<input name="run_interval_hours" type="number" step="0.5" min="0.5" value="{config.get('run_interval_hours',0.05)*60}" placeholder="2">
+<div style="color:#475569;font-size:11px;margin-top:3px">How often the agent checks all sources for new jobs. Default: 2 minutes (real-time monitoring). Lower = faster but more API calls.</div>
+<label>Max Job Age (days)</label>
+<input name="max_age_days" type="number" step="0.5" min="0.5" max="7" value="{config.get('max_age_days',1)}" placeholder="1">
+<div style="color:#475569;font-size:11px;margin-top:3px">Only discover jobs posted within this many days. Default: 1 day (real-time focus on fresh jobs only)</div>
 <label>Max Jobs Per Source</label>
 <input name="max_per_source" type="number" min="5" max="100" value="{config.get('max_per_source',30)}" placeholder="30">
 <label>Max Applications Per Cycle</label>
 <input name="max_applications_per_cycle" type="number" min="1" max="50" value="{config.get('max_applications_per_cycle',10)}" placeholder="10">
-<div style="color:#475569;font-size:11px;margin-top:3px">Max jobs to auto-apply to in a single cycle (prevents spam)</div>
+<div style="color:#475569;font-size:11px;margin-top:3px">Max jobs to auto-apply to in a single scan (prevents spam)</div>
 <label>Notification Webhook (optional, future WhatsApp)</label>
 <input name="notification_webhook" value="{config.get('notification_webhook','')}" placeholder="https://hooks.whatsapp.com/...">
 <button type="submit" class="btn" style="margin-top:15px">Save Configuration</button>
@@ -428,13 +432,31 @@ async def config_page():
 async def save_config_form(request: Request):
     form = await request.form()
     config = {}
-    for key in ["run_interval_hours", "max_per_source", "max_applications_per_cycle"]:
+    
+    # Scan interval — stored as hours internally (minutes / 60)
+    scan_min = form.get("run_interval_hours", "")
+    if scan_min:
+        try:
+            config["run_interval_hours"] = float(scan_min) / 60.0  # minutes -> hours
+        except (ValueError, TypeError):
+            pass
+    
+    # Max job age (days)
+    max_age = form.get("max_age_days", "")
+    if max_age:
+        try:
+            config["max_age_days"] = float(max_age)
+        except (ValueError, TypeError):
+            pass
+    
+    for key in ["max_per_source", "max_applications_per_cycle"]:
         val = form.get(key, "")
         if val:
             try:
-                config[key] = float(val) if key == "run_interval_hours" else int(val)
+                config[key] = int(val)
             except (ValueError, TypeError):
                 pass
+    
     webhook = form.get("notification_webhook", "")
     if webhook:
         config["notification_webhook"] = webhook
