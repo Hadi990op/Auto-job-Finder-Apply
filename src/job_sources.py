@@ -6,6 +6,7 @@ Scrapes jobs from multiple free sources:
   - Remotive (free JSON API)
   - WeWorkRemotely (RSS feed)
   - Jobspresso (RSS feed)
+  - Freelancer.com (RSS feed)
 
 All sources are free, require no authentication, and return structured data.
 """
@@ -391,6 +392,93 @@ def search_jobspresso(limit: int = 20) -> list[JobListing]:
         return []
 
 
+# --- Freelancer.com (RSS) ---
+
+def search_freelancer(keywords: list = None, limit: int = 50) -> list[JobListing]:
+    """Fetch projects from Freelancer.com RSS feeds by keyword."""
+    if keywords is None:
+        keywords = ["python", "javascript", "react", "node.js", "web development"]
+
+    jobs = []
+    seen_ids = set()
+
+    for kw in keywords:
+        try:
+            url = f"https://www.freelancer.com/rss.xml?keyword={urllib.parse.quote(kw)}"
+            raw = _fetch(url)
+            if not raw:
+                continue
+
+            root = ET.fromstring(raw)
+            items = root.findall(".//item")
+
+            for item in items:
+                title_elem = item.find("title")
+                link_elem = item.find("link")
+                desc_elem = item.find("description")
+                date_elem = item.find("pubDate")
+                guid_elem = item.find("guid")
+
+                title = title_elem.text if title_elem is not None else ""
+                link = link_elem.text if link_elem is not None else ""
+                raw_desc = desc_elem.text if desc_elem is not None else ""
+                desc = _strip_html(raw_desc)
+                pub_date = date_elem.text if date_elem is not None else ""
+                guid = guid_elem.text if guid_elem is not None else ""
+
+                # Build ID from guid, e.g. "Freelancer_project_40568038" -> "flc_40568038"
+                num_match = re.search(r"(\d+)", guid)
+                if num_match:
+                    job_id = f"flc_{num_match.group(1)}"
+                else:
+                    job_id = f"flc_{re.sub(r'[^a-zA-Z0-9]', '_', guid)[-40:]}"
+
+                # Deduplicate across keywords
+                if job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+
+                # Parse budget and skills from the description text
+                # Expected format: "... (Budget: $X - $Y USD, Jobs: Skill1, Skill2, ...)"
+                budget = ""
+                tags = []
+                m = re.search(r"\(Budget: (.+?), Jobs: (.+?)\)", raw_desc or "")
+                if m:
+                    budget = m.group(1).strip()
+                    jobs_str = m.group(2).strip()
+                    tags = [t.strip() for t in jobs_str.split(",") if t.strip()]
+
+                # Supplement tags from <category> elements
+                for cat_elem in item.findall("category"):
+                    if cat_elem.text:
+                        cat = cat_elem.text.strip()
+                        if cat and cat not in tags:
+                            tags.append(cat)
+
+                jobs.append(JobListing(
+                    id=job_id,
+                    source="freelancer",
+                    title=title,
+                    company="Freelancer.com Client",
+                    location="Remote",
+                    url=link,
+                    description=desc[:5000],
+                    apply_url=link,
+                    date=pub_date,
+                    tags=tags,
+                    salary=budget
+                ))
+
+                if len(jobs) >= limit:
+                    return jobs
+            time.sleep(0.3)  # be nice to server
+        except Exception as e:
+            print(f"  [Freelancer:{kw}] Error: {e}")
+            continue
+
+    return jobs[:limit]
+
+
 # --- LinkedIn detail fetch ---
 
 def fetch_linkedin_detail(job_id: str) -> str:
@@ -499,6 +587,21 @@ def scrape_all_jobs(
     jsp_jobs = search_jobspresso(limit=20)
     print(f"    -> Found {len(jsp_jobs)} jobs")
     all_jobs.extend(jsp_jobs)
+
+    # 6. Freelancer.com
+    print("  [Freelancer] Fetching RSS...")
+    freelancer_keywords = []
+    if job_titles:
+        freelancer_keywords.extend(job_titles[:5])
+    if skills:
+        for s in skills[:5]:
+            if s not in freelancer_keywords:
+                freelancer_keywords.append(s)
+    if not freelancer_keywords:
+        freelancer_keywords = ["python", "javascript", "react", "node.js", "web development"]
+    flc_jobs = search_freelancer(keywords=freelancer_keywords, limit=max_per_source)
+    print(f"    -> Found {len(flc_jobs)} jobs")
+    all_jobs.extend(flc_jobs)
 
     # Filter by date — only keep jobs posted within max_age_days
     if max_age_days > 0:

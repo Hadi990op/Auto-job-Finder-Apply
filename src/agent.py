@@ -30,6 +30,8 @@ from generator import generate_cv, generate_cover_letter, generate_job_match_rep
 from ai_engine import ai_generate_cv, ai_generate_cover_letter, ai_evaluate_job, ai_enhance_profile
 import json as _json
 
+from playwright.sync_api import sync_playwright
+
 # WhatsApp is optional — works without it
 try:
     from whatsapp import send_notification as whatsapp_send, is_connected as whatsapp_connected, get_config as whatsapp_config
@@ -139,6 +141,17 @@ def init_db():
         INSERT OR IGNORE INTO agent_state (id, last_run, next_run, config)
         VALUES (1, '', '', '{}')
     """)
+
+    # Add screenshot columns if they don't exist (migration)
+    try:
+        db.execute("ALTER TABLE applications ADD COLUMN screenshot_path TEXT")
+    except:
+        pass
+    try:
+        db.execute("ALTER TABLE applications ADD COLUMN page_title TEXT")
+    except:
+        pass
+
     db.commit()
     db.close()
 
@@ -352,6 +365,39 @@ def evaluate_job_smart(job: dict, profile: dict, use_ai: bool = True) -> Evaluat
         return kw_result
 
 
+def capture_application_proof(app_id: int, job_url: str) -> Optional[str]:
+    """Capture a screenshot of the job page as proof of application."""
+    if not job_url or not job_url.startswith("http"):
+        return None
+
+    proof_dir = DATA_DIR / "proofs"
+    proof_dir.mkdir(exist_ok=True)
+    screenshot_path = proof_dir / f"app_{app_id}.png"
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(job_url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)  # Let page settle
+            page.screenshot(path=str(screenshot_path), full_page=False)
+            page_title = page.title()
+            browser.close()
+
+        # Store in database
+        db = get_db()
+        db.execute("UPDATE applications SET screenshot_path = ?, page_title = ? WHERE id = ?",
+                    (str(screenshot_path), page_title, app_id))
+        db.commit()
+        db.close()
+
+        print(f"  [Proof] Screenshot saved: {screenshot_path}")
+        return str(screenshot_path)
+    except Exception as e:
+        print(f"  [Proof] Screenshot failed: {e}")
+        return None
+
+
 def auto_apply_to_job(job: dict, profile: dict, evaluation: EvaluationResult) -> dict:
     """
     Attempt to auto-apply to a job.
@@ -423,6 +469,9 @@ def auto_apply_to_job(job: dict, profile: dict, evaluation: EvaluationResult) ->
         apply_method=apply_method,
         apply_result=apply_result
     )
+
+    # Capture proof screenshot
+    capture_application_proof(app_id, apply_url if apply_url.startswith("http") else job.get("url", ""))
 
     mark_job_status(job_id, "applied")
 

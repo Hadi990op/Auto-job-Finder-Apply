@@ -671,6 +671,18 @@ async def application_detail(app_id: int):
 
     a = dict(app_row)
     statuses = ["applied", "interview", "offer", "rejected"]
+
+    # Check for proof screenshot
+    screenshot_html = ""
+    if a.get("screenshot_path"):
+        screenshot_html = f"""
+<div class="section">
+<h2>📸 Proof of Application</h2>
+<p style="color:#94a3b8;margin-bottom:10px">Page captured: {a.get('page_title', 'N/A')}</p>
+<img src="{BASE}/api/proof/{app_id}" style="width:100%;border:1px solid #334155;border-radius:8px" alt="Application proof screenshot" />
+</div>
+"""
+
     eval_data = ""
     try:
         ev = json.loads(a.get("evaluation", "{}"))
@@ -696,6 +708,8 @@ async def application_detail(app_id: int):
 <p><strong>Result:</strong> {a.get('apply_result','')}</p>
 </div>
 
+{screenshot_html}
+
 <form method="POST" action="{BASE}/application/{app_id}">
 <div class="section">
 <h2>Update Status</h2>
@@ -720,6 +734,20 @@ async def application_detail(app_id: int):
 async def update_app(app_id: int, status: str = Form(...), notes: str = Form("")):
     update_application_status(app_id, status, notes)
     return HTMLResponse(f'<meta http-equiv="refresh" content="0;url={BASE}/application/{app_id}">')
+
+
+@app.get("/api/proof/{app_id}")
+async def get_proof_screenshot(app_id: int):
+    db = get_db()
+    row = db.execute("SELECT screenshot_path FROM applications WHERE id = ?", (app_id,)).fetchone()
+    db.close()
+    if not row or not row["screenshot_path"]:
+        raise HTTPException(404, "No proof screenshot")
+    from fastapi.responses import FileResponse
+    path = row["screenshot_path"]
+    if not os.path.exists(path):
+        raise HTTPException(404, "Screenshot file not found")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/activity", response_class=HTMLResponse)
