@@ -30,12 +30,16 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Res
 from agent import (
     init_db, get_profile, save_profile, get_agent_state, update_agent_state,
     get_config, get_applications, get_job, update_application_status,
-    run_agent_cycle, log_activity, auto_apply_to_job, get_unseen_jobs
+    run_agent_cycle, log_activity, auto_apply_to_job, get_unseen_jobs,
+    get_credentials, save_credentials, get_settings, save_settings
 )
 from evaluator import evaluate_job
 from generator import generate_cv, generate_cover_letter, generate_job_match_report
 from job_sources import scrape_all_jobs, fetch_linkedin_detail
 from ai_engine import ai_generate_cv, ai_generate_cover_letter, ai_evaluate_job, ai_enhance_profile, test_ai
+
+# Manual login browser (noVNC)
+import manual_login
 
 # CV upload management
 from cv_manager import (
@@ -150,6 +154,7 @@ def nav(active: str = "") -> str:
 <a href="{BASE}/" class="{'active' if active=='home' else ''}">Dashboard</a>
 <a href="{BASE}/profile" class="{'active' if active=='profile' else ''}">Profile</a>
 <a href="{BASE}/cv" class="{'active' if active=='cv' else ''}">My CVs</a>
+<a href="{BASE}/credentials" class="{'active' if active=='credentials' else ''}">🔑 Login Accounts</a>
 <a href="{BASE}/jobs" class="{'active' if active=='jobs' else ''}">Jobs</a>
 <a href="{BASE}/applications" class="{'active' if active=='apps' else ''}">Applications</a>
 <a href="{BASE}/whatsapp" class="{'active' if active=='whatsapp' else ''}">WhatsApp</a>
@@ -215,42 +220,144 @@ async def dashboard():
 
 <div class="section">
 <h2>Agent Control</h2>
-<p style="color:#64748b;margin-bottom:15px">The agent monitors all job sources every 2 minutes. When a new matching job is posted, it applies <strong>instantly</strong> — no waiting. You can also trigger a manual scan now.</p>
+<p style="color:#64748b;margin-bottom:15px">The agent monitors all job sources every 2 minutes. When a new matching job is posted, it applies <strong>instantly</strong> — no waiting.</p>
+
+<div id="agent-status-box" style="margin-bottom:15px;padding:15px;border-radius:8px;background:#1e293b;border:1px solid #334155">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+<div>
+<strong style="font-size:15px">Agent Status:</strong>
+<span id="agent-state-badge" style="margin-left:8px;padding:4px 12px;border-radius:4px;font-size:13px;background:#475569;color:#fff">Loading...</span>
+</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button class="btn btn-green" onclick="controlAgent('start')" id="agent-start-btn" style="display:none">▶ Start Agent</button>
+<button class="btn" style="background:#dc2626;color:white" onclick="controlAgent('stop')" id="agent-stop-btn" style="display:none">⏹ Stop Agent</button>
+<button class="btn btn-green" onclick="runAgent()" id="run-btn">▶ Run Once Now</button>
+</div>
+</div>
+<div style="margin-top:10px;font-size:13px;color:#94a3b8">
+<span>Browser: <span id="browser-state-badge" style="padding:2px 8px;border-radius:4px;background:#475569;color:#fff">Checking...</span></span>
+<span style="margin-left:15px">LinkedIn: <span id="linkedin-state-badge" style="padding:2px 8px;border-radius:4px;background:#475569;color:#fff">Checking...</span></span>
+<button class="btn btn-sec" style="margin-left:15px;padding:3px 10px;font-size:12px" onclick="controlBrowser('start')" id="browser-start-btn" style="display:none">▶ Start Browser</button>
+<button class="btn" style="background:#dc2626;color:white;padding:3px 10px;font-size:12px" onclick="controlBrowser('stop')" id="browser-stop-btn" style="display:none">⏹ Stop Browser</button>
+<a href="{BASE}/login-browser" class="btn btn-sec" style="margin-left:8px;padding:3px 10px;font-size:12px">🔐 Login to LinkedIn</a>
+</div>
+</div>
+
 <div id="run-result"></div>
-<button class="btn btn-green" onclick="runAgent()" id="run-btn">▶ Run Agent Now</button>
 <a href="{BASE}/config" class="btn btn-sec">⚙ Configure</a>
 <a href="{BASE}/activity" class="btn btn-sec">View Activity Log</a>
+</div>
+
 <script>
+// Fetch and display agent/browser status
+async function fetchAgentStatus() {{
+try {{
+const resp = await fetch('{BASE}/api/agent/status');
+const data = await resp.json();
+
+// Agent loop status
+const loopActive = data.agent_loop.active;
+const loopBadge = document.getElementById('agent-state-badge');
+const startBtn = document.getElementById('agent-start-btn');
+const stopBtn = document.getElementById('agent-stop-btn');
+
+if (loopActive) {{
+loopBadge.textContent = '● Running (auto-scan every 2 min)';
+loopBadge.style.background = '#16a34a';
+startBtn.style.display = 'none';
+stopBtn.style.display = 'inline-block';
+}} else {{
+loopBadge.textContent = '● Stopped';
+loopBadge.style.background = '#dc2626';
+startBtn.style.display = 'inline-block';
+stopBtn.style.display = 'none';
+}}
+
+// Browser status
+const browserRunning = data.persistent_browser.running;
+const browserBadge = document.getElementById('browser-state-badge');
+const linkedinBadge = document.getElementById('linkedin-state-badge');
+const bStartBtn = document.getElementById('browser-start-btn');
+const bStopBtn = document.getElementById('browser-stop-btn');
+
+if (browserRunning) {{
+browserBadge.textContent = '● Running';
+browserBadge.style.background = '#16a34a';
+bStartBtn.style.display = 'none';
+bStopBtn.style.display = 'inline-block';
+}} else {{
+browserBadge.textContent = '● Off';
+browserBadge.style.background = '#dc2626';
+bStartBtn.style.display = 'inline-block';
+bStopBtn.style.display = 'none';
+}}
+
+if (data.persistent_browser.linkedin_logged_in) {{
+linkedinBadge.textContent = '● Logged In';
+linkedinBadge.style.background = '#16a34a';
+}} else {{
+linkedinBadge.textContent = '● Not Logged In';
+linkedinBadge.style.background = '#dc2626';
+}}
+}} catch(e) {{
+console.error('Status fetch error:', e);
+}}
+}}
+
+async function controlAgent(action) {{
+try {{
+const resp = await fetch('{BASE}/api/agent/' + action, {{method:'POST'}});
+const data = await resp.json();
+alert(data.message || data.status);
+fetchAgentStatus();
+}} catch(e) {{
+alert('Error: ' + e.message);
+}}
+}}
+
+async function controlBrowser(action) {{
+try {{
+const resp = await fetch('{BASE}/api/browser/' + action, {{method:'POST'}});
+const data = await resp.json();
+alert(data.message || data.status);
+setTimeout(fetchAgentStatus, 2000);
+}} catch(e) {{
+alert('Error: ' + e.message);
+}}
+}}
+
 async function runAgent() {{
 document.getElementById('run-btn').disabled = true;
 document.getElementById('run-btn').innerHTML = '<span class="spinner"></span> Running...';
-document.getElementById('run-result').innerHTML = '<div style="padding:20px;text-align:center"><span class="spinner"></span><p style="margin-top:10px;color:#64748b">Agent is running in background...<br>Check <a href="{BASE}/activity" style="color:#60a5fa">Activity Log</a> for live progress.<br>AI generation takes ~1 min per job.</p></div>';
+document.getElementById('run-result').innerHTML = '<div style="padding:20px;text-align:center"><span class="spinner"></span><p style="margin-top:10px;color:#64748b">Agent is running...<br>Check <a href="{BASE}/activity" style="color:#60a5fa">Activity Log</a> for progress.</p></div>';
 try {{
 const resp = await fetch('{BASE}/api/run');
 const data = await resp.json();
 if (data.status === 'started') {{
-document.getElementById('run-result').innerHTML = '<div class="alert-ok" style="padding:15px;border-radius:8px;margin-bottom:15px">✓ Agent started! Check <a href="{BASE}/activity" style="color:#6ee7b7">Activity Log</a> for live progress.</div>';
+document.getElementById('run-result').innerHTML = '<div class="alert-ok" style="padding:15px;border-radius:8px;margin-bottom:15px">✓ Agent started! Check <a href="{BASE}/activity" style="color:#6ee7b7">Activity Log</a> for progress.</div>';
 document.getElementById('run-btn').disabled = false;
-document.getElementById('run-btn').innerHTML = '▶ Run Agent Now';
-// Auto-refresh activity log
+document.getElementById('run-btn').innerHTML = '▶ Run Once Now';
 setTimeout(() => location.href = '{BASE}/activity', 3000);
 }} else if (data.status === 'already_running') {{
 document.getElementById('run-result').innerHTML = '<div class="alert-warn" style="padding:15px;border-radius:8px">Agent is already running. <a href="{BASE}/activity" style="color:#fcd34d">View progress →</a></div>';
 document.getElementById('run-btn').disabled = false;
-document.getElementById('run-btn').innerHTML = '▶ Run Agent Now';
-}} else if (data.error) {{
-document.getElementById('run-result').innerHTML = '<div class="alert-warn">⚠ ' + data.error + '</div>';
+document.getElementById('run-btn').innerHTML = '▶ Run Once Now';
+}} else {{
+document.getElementById('run-result').innerHTML = '<div class="alert-warn">⚠ ' + (data.error || data.message || 'Unknown error') + '</div>';
 document.getElementById('run-btn').disabled = false;
-document.getElementById('run-btn').innerHTML = '▶ Run Agent Now';
+document.getElementById('run-btn').innerHTML = '▶ Run Once Now';
 }}
 }} catch(e) {{
 document.getElementById('run-result').innerHTML = '<div class="alert-warn">Error: ' + e.message + '</div>';
 document.getElementById('run-btn').disabled = false;
-document.getElementById('run-btn').innerHTML = '▶ Run Agent Now';
+document.getElementById('run-btn').innerHTML = '▶ Run Once Now';
 }}
 }}
+
+// Fetch status on load and every 10 seconds
+fetchAgentStatus();
+setInterval(fetchAgentStatus, 10000);
 </script>
-</div>
 
 <div class="section">
 <h2>Recent Activity</h2>
@@ -470,6 +577,395 @@ async def save_config_form(request: Request):
     return HTMLResponse(f'<meta http-equiv="refresh" content="2;url={BASE}/config">')
 
 
+@app.get("/credentials", response_class=HTMLResponse)
+async def credentials_page():
+    creds = get_credentials()
+    settings = get_settings()
+    session = manual_login.get_session_status()
+    has_gmail = "✅ Set" if creds.get("gmail_email") and creds.get("gmail_password") else "❌ Not set"
+    has_linkedin = "✅ Set" if creds.get("linkedin_email") and creds.get("linkedin_password") else "❌ Not set"
+
+    gmail_email_display = creds.get("gmail_email", "") or "(not set)"
+    linkedin_email_display = creds.get("linkedin_email", "") or "(not set)"
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login Accounts — Job Agent</title>
+<style>{CSS}</style></head><body>
+{nav(active='credentials')}
+<div class="container">
+<h1>🔑 Login Accounts</h1>
+<p class="subtitle">Agent uses these credentials to log in to job sites and apply on your behalf</p>
+
+<div class="section">
+<h2>Gmail / Google Account {has_gmail}</h2>
+<p style="color:#64748b;font-size:13px;margin-bottom:15px">
+    Used for Google login (Sign in with Google) and email+password logins on job sites.<br>
+    Current: <strong>{gmail_email_display}</strong>
+</p>
+<form method="POST" action="{BASE}/credentials">
+<input type="hidden" name="type" value="gmail">
+<label>Gmail Email</label>
+<input name="gmail_email" type="email" value="{creds.get('gmail_email', '')}" placeholder="your.email@gmail.com">
+<label>Gmail Password</label>
+<input name="gmail_password" type="password" value="{creds.get('gmail_password', '')}" placeholder="Your Gmail password">
+<div style="color:#f59e0b;font-size:11px;margin-top:5px">
+    ⚠️ Note: Google may require 2FA or show a security warning for automated logins. 
+    If login fails, you may need to enable "Less secure apps" or use an App Password.
+</div>
+<button type="submit" class="btn" style="margin-top:15px">Save Gmail Credentials</button>
+</form>
+</div>
+
+<div class="section">
+<h2>LinkedIn Account {has_linkedin}</h2>
+<p style="color:#64748b;font-size:13px;margin-bottom:15px">
+    Used for LinkedIn job applications and "Sign in with LinkedIn" on job sites.<br>
+    Current: <strong>{linkedin_email_display}</strong>
+</p>
+<form method="POST" action="{BASE}/credentials">
+<input type="hidden" name="type" value="linkedin">
+<label>LinkedIn Email</label>
+<input name="linkedin_email" type="email" value="{creds.get('linkedin_email', '')}" placeholder="your.email@linkedin.com">
+<label>LinkedIn Password</label>
+<input name="linkedin_password" type="password" value="{creds.get('linkedin_password', '')}" placeholder="Your LinkedIn password">
+<div style="color:#f59e0b;font-size:11px;margin-top:5px">
+    ⚠️ Note: LinkedIn may require 2FA verification. If login fails, you'll need to 
+    manually verify. Login sessions are saved in browser profile for future use.
+</div>
+<button type="submit" class="btn" style="margin-top:15px">Save LinkedIn Credentials</button>
+</form>
+</div>
+
+<div class="section">
+<h2>How Auto-Apply Login Works</h2>
+<div style="color:#475569;font-size:13px;line-height:1.8">
+    <p>📋 <strong>Without credentials:</strong> Agent discovers jobs, generates CV + cover letter, but cannot 
+    actually submit applications on sites that require login. Jobs are marked as <code style="background:#fef3c7;padding:2px 6px;border-radius:3px">apply_failed</code>.</p>
+    <p>📋 <strong>With Gmail credentials:</strong> Agent can log in to sites using "Sign in with Google" 
+    or email+password, then fill and submit application forms.</p>
+    <p>📋 <strong>With LinkedIn credentials:</strong> Agent can log in to LinkedIn and apply to 
+    LinkedIn jobs directly using your account.</p>
+    <p>📋 <strong>Browser session persistence:</strong> Login sessions are saved in a browser profile 
+    directory. Once logged in, the agent stays logged in across cycles (no need to log in every time).</p>
+    <p>🔒 <strong>Security:</strong> Credentials are stored locally in the agent's database on this VM. 
+    They are NOT sent anywhere except to the login pages themselves.</p>
+</div>
+</div>
+
+<div class="section" style="border:2px solid #10b981">
+<h2>🔐 Manual Login (Recommended — Free!)</h2>
+<p style="color:#64748b;font-size:13px;margin-bottom:15px">
+    <strong style="color:#10b981">Log in yourself once → agent saves session → zero captcha cost forever!</strong><br>
+    No 2Captcha needed. You solve the captcha yourself in a real browser. Session saves automatically.<br>
+    LinkedIn session: <strong>{("✅ Saved" if session.get("linkedin_logged_in") else "❌ Not logged in")}</strong>
+</p>
+<a href="{BASE}/login-browser" class="btn" style="background:#10b981;display:inline-block;text-decoration:none;text-align:center">
+    🔐 Open Manual Login Browser →
+</a>
+</div>
+
+<div class="section">
+<h2>🤖 reCAPTCHA Solver (2Captcha) — Alternative
+<p style="color:#64748b;font-size:13px;margin-bottom:15px">
+    LinkedIn and some job sites show reCAPTCHA challenges during login. 
+    2Captcha is a paid service that solves reCAPTCHA automatically (~$0.77 per 1000 solves).<br>
+    <strong>Without 2Captcha:</strong> Login will fail on sites with reCAPTCHA (LinkedIn, etc.)<br>
+    <strong>With 2Captcha:</strong> Agent solves reCAPTCHA automatically and continues with login.<br>
+    Current: <strong>{("✅ Set" if settings.get("twocaptcha_api_key") else "❌ Not set")}</strong>
+</p>
+<form method="POST" action="{BASE}/settings">
+<label>2Captcha API Key</label>
+<input name="twocaptcha_api_key" type="password" value="{settings.get("twocaptcha_api_key", "")}" placeholder="Your 2Captcha API key (e.g. a1b2c3d4...)">
+<label>Browser Mode</label>
+<div style="margin:5px 0">
+<label style="display:inline-block;margin-right:15px;font-weight:normal">
+<input type="radio" name="use_headed_mode" value="1" {"checked" if settings.get("use_headed_mode", True) else ""}> Headed (Xvfb) — better for bypassing bot detection
+</label>
+<label style="display:inline-block;font-weight:normal">
+<input type="radio" name="use_headed_mode" value="0" {"checked" if not settings.get("use_headed_mode", True) else ""}> Headless — faster but more captchas
+</label>
+</div>
+<div style="color:#94a3b8;font-size:11px;margin-top:5px">
+    Get your API key: <a href="https://2captcha.com" target="_blank" style="color:#60a5fa">2captcha.com</a> → 
+    Sign up → Deposit $5 → Dashboard → API key. Cost: ~$0.77 per 1000 reCAPTCHA solves.
+</div>
+<button type="submit" class="btn" style="margin-top:15px">Save Settings</button>
+</form>
+</div>
+
+</div></body></html>"""
+
+
+@app.post("/credentials")
+async def save_credentials_form(request: Request):
+    form = await request.form()
+    cred_type = form.get("type", "")
+
+    existing = get_credentials()
+
+    if cred_type == "gmail":
+        gmail_email = form.get("gmail_email", "")
+        gmail_password = form.get("gmail_password", "")
+        save_credentials(
+            gmail_email=gmail_email,
+            gmail_password=gmail_password,
+            linkedin_email=existing.get("linkedin_email", ""),
+            linkedin_password=existing.get("linkedin_password", ""),
+        )
+        log_activity("credentials_updated", f"Gmail credentials updated: {gmail_email}")
+    elif cred_type == "linkedin":
+        linkedin_email = form.get("linkedin_email", "")
+        linkedin_password = form.get("linkedin_password", "")
+        save_credentials(
+            gmail_email=existing.get("gmail_email", ""),
+            gmail_password=existing.get("gmail_password", ""),
+            linkedin_email=linkedin_email,
+            linkedin_password=linkedin_password,
+        )
+        log_activity("credentials_updated", f"LinkedIn credentials updated: {linkedin_email}")
+
+    return HTMLResponse(f'<meta http-equiv="refresh" content="2;url={BASE}/credentials"><div style="padding:40px;text-align:center;font-family:system-ui"><h2>✅ Credentials saved!</h2><p>Redirecting...</p></div>')
+
+
+@app.get("/api/credentials")
+async def api_get_credentials():
+    creds = get_credentials()
+    # Don't return passwords in API for security
+    return JSONResponse({
+        "gmail_email": creds.get("gmail_email", ""),
+        "gmail_password_set": bool(creds.get("gmail_password")),
+        "linkedin_email": creds.get("linkedin_email", ""),
+        "linkedin_password_set": bool(creds.get("linkedin_password")),
+    })
+
+
+@app.post("/api/credentials")
+async def api_save_credentials(request: Request):
+    body = await request.json()
+    existing = get_credentials()
+    save_credentials(
+        gmail_email=body.get("gmail_email", existing.get("gmail_email", "")),
+        gmail_password=body.get("gmail_password", existing.get("gmail_password", "")),
+        linkedin_email=body.get("linkedin_email", existing.get("linkedin_email", "")),
+        linkedin_password=body.get("linkedin_password", existing.get("linkedin_password", "")),
+    )
+    return JSONResponse({"status": "ok"})
+
+
+@app.post("/settings")
+async def save_settings_form(request: Request):
+    form = await request.form()
+    twocaptcha_api_key = form.get("twocaptcha_api_key", "")
+    use_headed = form.get("use_headed_mode", "1") == "1"
+    save_settings(twocaptcha_api_key=twocaptcha_api_key, use_headed_mode=use_headed)
+    log_activity("settings_updated", f"Settings updated: 2Captcha {'set' if twocaptcha_api_key else 'cleared'}, headed={use_headed}")
+    return HTMLResponse(f'<meta http-equiv="refresh" content="2;url={BASE}/credentials"><div style="padding:40px;text-align:center;font-family:system-ui"><h2>✅ Settings saved!</h2><p>Redirecting...</p></div>')
+
+
+@app.get("/api/settings")
+async def api_get_settings():
+    settings = get_settings()
+    return JSONResponse({
+        "twocaptcha_api_key_set": bool(settings.get("twocaptcha_api_key")),
+        "use_headed_mode": settings.get("use_headed_mode", True),
+    })
+
+
+@app.post("/api/settings")
+async def api_save_settings(request: Request):
+    body = await request.json()
+    save_settings(
+        twocaptcha_api_key=body.get("twocaptcha_api_key", ""),
+        use_headed_mode=body.get("use_headed_mode", True),
+    )
+    return JSONResponse({"status": "ok"})
+
+
+# ===================== MANUAL LOGIN BROWSER =====================
+
+@app.post("/api/login-browser/start")
+async def login_browser_start(request: Request):
+    """Start a real browser with noVNC so user can log in manually."""
+    import asyncio
+    body = await request.json()
+    url = body.get("url", "https://www.linkedin.com/login")
+    result = await asyncio.get_event_loop().run_in_executor(None, manual_login.start, url)
+    return JSONResponse(result)
+
+
+@app.post("/api/login-browser/stop")
+async def login_browser_stop():
+    """Stop the manual login browser. Session is saved to browser_profile."""
+    import asyncio
+    result = await asyncio.get_event_loop().run_in_executor(None, manual_login.stop)
+    log_activity("manual_login", "Manual login browser stopped — session saved")
+    return JSONResponse(result)
+
+
+@app.get("/api/login-browser/status")
+async def login_browser_status():
+    """Check if login browser is running and if session is saved."""
+    st = manual_login.status()
+    session = manual_login.get_session_status()
+    return JSONResponse({**st, "session": session})
+
+
+@app.get("/login-browser", response_class=HTMLResponse)
+async def login_browser_page():
+    """Dashboard page for manual login browser."""
+    st = manual_login.status()
+    session = manual_login.get_session_status()
+
+    running = st.get("running", False)
+    linkedin_logged_in = session.get("linkedin_logged_in", False)
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Manual Login — Job Agent</title>
+<style>{CSS}</style>
+<style>
+.vnc-frame{{
+    width:100%;height:600px;border:2px solid #334155;border-radius:8px;
+    background:#000;margin-top:15px;
+}}
+.btn-start{{background:#10b981;color:#fff;padding:12px 24px;border:none;
+    border-radius:6px;font-size:15px;cursor:pointer;margin:5px;font-weight:600}}
+.btn-stop{{background:#ef4444;color:#fff;padding:12px 24px;border:none;
+    border-radius:6px;font-size:15px;cursor:pointer;margin:5px;font-weight:600}}
+.btn-link{{background:#3b82f6;color:#fff;padding:12px 24px;border:none;
+    border-radius:6px;font-size:15px;cursor:pointer;margin:5px;text-decoration:none;
+    display:inline-block;font-weight:600}}
+.status-badge{{display:inline-block;padding:6px 14px;border-radius:20px;
+    font-size:13px;font-weight:600;margin:5px}}
+.badge-green{{background:#065f46;color:#10b981}}
+.badge-red{{background:#7f1d1d;color:#fca5a5}}
+.badge-yellow{{background:#78350f;color:#fcd34d}}
+.url-input{{width:100%;padding:10px;background:#1e293b;border:1px solid #334155;
+    border-radius:6px;color:#e2e8f0;font-size:14px;margin:10px 0}}
+.instructions{{background:#1e293b;padding:20px;border-radius:8px;margin:15px 0;
+    line-height:1.8;font-size:14px;color:#94a3b8}}
+.instructions strong{{color:#e2e8f0}}
+.step{{display:flex;align-items:flex-start;gap:10px;margin:8px 0}}
+.step-num{{background:#3b82f6;color:#fff;width:24px;height:24px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;font-size:13px;
+    font-weight:700;flex-shrink:0}}
+</style></head><body>
+{nav(active='credentials')}
+<div class="container">
+<h1>🔐 Manual Login Browser</h1>
+<p class="subtitle">Log in to LinkedIn yourself — agent saves your session for future auto-applies (no captcha cost!)</p>
+
+<div style="margin:20px 0">
+<span class="status-badge {"badge-green" if linkedin_logged_in else "badge-red"}">
+{"✅ LinkedIn session saved" if linkedin_logged_in else "❌ No LinkedIn session yet"}
+</span>
+<span class="status-badge {"badge-green" if running else "badge-yellow"}">
+{"🟢 Browser running" if running else "⚪ Browser not running"}
+</span>
+</div>
+
+<div class="instructions">
+<p style="font-size:16px;color:#e2e8f0;margin-bottom:10px"><strong>📝 How it works:</strong></p>
+<div class="step"><span class="step-num">1</span><div>Click <strong>Start Browser</strong> below — a real Chromium browser opens LinkedIn login page</div></div>
+<div class="step"><span class="step-num">2</span><div>The browser appears in the black box below (or click <strong>Open in New Tab</strong> for full screen)</div></div>
+<div class="step"><span class="step-num">3</span><div>Log in with your email + password. Solve any captcha yourself (no 2Captcha needed!)</div></div>
+<div class="step"><span class="step-num">4</span><div>Once logged in, click <strong>Stop &amp; Save Session</strong> — your login is saved permanently</div></div>
+<div class="step"><span class="step-num">5</span><div>Agent will use your saved session for all future auto-applies — no captcha, no cost!</div></div>
+</div>
+
+<div style="margin:20px 0">
+<label style="display:block;margin-bottom:5px;font-size:13px;color:#94a3b8">Login URL (change if needed):</label>
+<input type="text" id="login-url" class="url-input" value="https://www.linkedin.com/login">
+<div style="margin:10px 0">
+<button class="btn-start" onclick="startBrowser()">▶️ Start Browser</button>
+<button class="btn-stop" onclick="stopBrowser()">⏹️ Stop &amp; Save Session</button>
+<button class="btn-link" onclick="openVNC()" id="open-vnc-btn" style="display:none">🔍 Open in New Tab</button>
+</div>
+</div>
+
+<div id="status-msg" style="margin:10px 0;font-size:14px;color:#94a3b8"></div>
+
+<div id="vnc-container" style="display:none">
+<iframe class="vnc-frame" id="vnc-frame" src=""></iframe>
+</div>
+
+<div class="section" style="margin-top:25px">
+<h2>💡 Why Manual Login?</h2>
+<div style="color:#475569;font-size:13px;line-height:1.8">
+<p>LinkedIn shows reCAPTCHA on every automated login attempt. Solving captchas via 2Captcha costs money.</p>
+<p><strong>With manual login:</strong> You log in once yourself (solve captcha yourself), and the agent saves your session cookies. 
+All future auto-applies use your saved session — <strong>zero captcha cost, 100% success rate</strong>.</p>
+<p>Sessions last for weeks. You only need to re-login if LinkedIn logs you out (rare with persistent cookies).</p>
+</div>
+</div>
+
+</div>
+
+<script>
+async function startBrowser(){{
+    const url = document.getElementById('login-url').value;
+    const msg = document.getElementById('status-msg');
+    msg.innerHTML = '⏳ Starting browser...';
+    try {{
+        const res = await fetch('{BASE}/api/login-browser/start', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{url: url}})
+        }});
+        const data = await res.json();
+        if (data.success) {{
+            msg.innerHTML = '✅ Browser started! You can interact with it below.';
+            document.getElementById('vnc-container').style.display = 'block';
+            document.getElementById('vnc-frame').src = '/novnc/vnc.html?autoconnect=true&resize=scale&path=novnc/websockify';
+            document.getElementById('open-vnc-btn').style.display = 'inline-block';
+        }} else {{
+            msg.innerHTML = '❌ ' + (data.error || 'Failed to start');
+        }}
+    }} catch(e) {{
+        msg.innerHTML = '❌ Error: ' + e.message;
+    }}
+}}
+
+async function stopBrowser(){{
+    const msg = document.getElementById('status-msg');
+    msg.innerHTML = '⏳ Stopping and saving session...';
+    try {{
+        const res = await fetch('{BASE}/api/login-browser/stop', {{method: 'POST'}});
+        const data = await res.json();
+        if (data.success) {{
+            msg.innerHTML = '✅ ' + data.message;
+            document.getElementById('vnc-container').style.display = 'none';
+            document.getElementById('open-vnc-btn').style.display = 'none';
+            setTimeout(() => location.reload(), 2000);
+        }} else {{
+            msg.innerHTML = '❌ ' + (data.error || 'Failed to stop');
+        }}
+    }} catch(e) {{
+        msg.innerHTML = '❌ Error: ' + e.message;
+    }}
+}}
+
+function openVNC(){{
+    window.open('/novnc/vnc.html?autoconnect=true&resize=scale&path=novnc/websockify', '_blank');
+}}
+
+// Check status on load
+fetch('{BASE}/api/login-browser/status')
+    .then(r => r.json())
+    .then(data => {{
+        if (data.running) {{
+            document.getElementById('vnc-container').style.display = 'block';
+            document.getElementById('vnc-frame').src = '/novnc/vnc.html?autoconnect=true&resize=scale&path=novnc/websockify';
+            document.getElementById('open-vnc-btn').style.display = 'inline-block';
+            document.getElementById('status-msg').innerHTML = '🟢 Browser is already running!';
+        }}
+    }});
+</script>
+</body></html>"""
+
+
+
 @app.get("/jobs", response_class=HTMLResponse)
 async def jobs_page(status: str = ""):
     jobs = get_all_jobs(limit=100, status=status if status != "all" else None)
@@ -498,6 +994,7 @@ async def jobs_page(status: str = ""):
         <td><span class="badge {badge_class}">{verdict} ({score:.0f})</span></td>
         <td><span class="badge {status_class}">{job_status}</span></td>
         <td style="font-size:11px;color:#475569">{j.get('source','')}</td>
+        <td><button class="btn btn-green" style="font-size:11px;padding:3px 10px" onclick="applyNow('{j['id']}', this)">🎯 Apply</button></td>
         </tr>"""
 
     return f"""<!DOCTYPE html>
@@ -514,9 +1011,54 @@ async def jobs_page(status: str = ""):
 <a href="{BASE}/jobs?status=new" class="btn btn-sec" style="font-size:12px;padding:5px 12px">New</a>
 <a href="{BASE}/jobs?status=evaluated" class="btn btn-sec" style="font-size:12px;padding:5px 12px">Evaluated</a>
 <a href="{BASE}/jobs?status=applied" class="btn btn-sec" style="font-size:12px;padding:5px 12px">Applied</a>
+<a href="{BASE}/jobs?status=apply_failed" class="btn btn-sec" style="font-size:12px;padding:5px 12px">Failed</a>
 </div>
 
-{"<table><tr><th>Title</th><th>Company</th><th>Location</th><th>Fit</th><th>Status</th><th>Source</th></tr>" + rows_html + "</table>" if jobs else "<div class='alert'>No jobs discovered yet. Run the agent from the dashboard.</div>"}
+{"<table><tr><th>Title</th><th>Company</th><th>Location</th><th>Fit</th><th>Status</th><th>Source</th><th>Action</th></tr>" + rows_html + "</table>" if jobs else "<div class='alert'>No jobs discovered yet. Run the agent from the dashboard.</div>"}
+
+<div id="apply-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center">
+<div style="background:#1e293b;border-radius:12px;padding:30px;max-width:500px;width:90%;text-align:center">
+<h2 id="apply-modal-title" style="color:#f1f5f9">Applying...</h2>
+<p id="apply-modal-msg" style="color:#94a3b8;margin:15px 0">Generating CV & cover letter, then applying...</p>
+<div id="apply-modal-result"></div>
+<button onclick="closeModal()" style="margin-top:15px;background:#334155;color:#cbd5e1;border:none;padding:8px 20px;border-radius:6px;cursor:pointer">Close</button>
+</div>
+</div>
+
+<script>
+function applyNow(jobId, btn) {{
+    var modal = document.getElementById('apply-modal');
+    var msg = document.getElementById('apply-modal-msg');
+    var result = document.getElementById('apply-modal-result');
+    modal.style.display = 'flex';
+    msg.innerHTML = '<span class="spinner"></span> Generating CV & cover letter, then attempting to apply...';
+    result.innerHTML = '';
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Applying...';
+    fetch('{BASE}/api/apply/' + jobId, {{method:'POST'}})
+    .then(r => r.json())
+    .then(data => {{
+        btn.disabled = false;
+        btn.innerHTML = '🎯 Apply';
+        if (data.success) {{
+            msg.innerHTML = '';
+            result.innerHTML = '<div style="color:#6ee7b7;font-size:15px">✅ Applied successfully!</div><div style="color:#94a3b8;font-size:13px;margin-top:8px">' + (data.result || '') + '</div><a href="{BASE}/application/' + data.app_id + '" class="btn" style="margin-top:15px">View Application →</a>';
+        }} else {{
+            msg.innerHTML = '';
+            result.innerHTML = '<div style="color:#fca5a5;font-size:15px">❌ Apply failed</div><div style="color:#94a3b8;font-size:13px;margin-top:8px">' + (data.result || data.error || 'Unknown error') + '</div>';
+        }}
+    }})
+    .catch(e => {{
+        btn.disabled = false;
+        btn.innerHTML = '🎯 Apply';
+        msg.innerHTML = '';
+        result.innerHTML = '<div style="color:#fca5a5">Error: ' + e.message + '</div>';
+    }});
+}}
+function closeModal() {{
+    document.getElementById('apply-modal').style.display = 'none';
+}}
+</script>
 </div></body></html>"""
 
 
@@ -551,12 +1093,45 @@ async def job_detail_page(job_id: str):
 
     # Check if already applied
     db = get_db()
-    existing_app = db.execute("SELECT id FROM applications WHERE job_id = ?", (job_id,)).fetchone()
+    existing_app = db.execute("SELECT id, apply_method, apply_result FROM applications WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
     db.close()
 
     apply_html = ""
     if existing_app:
-        apply_html = f'<div class="alert-ok" style="margin-bottom:15px">✓ Already applied (Application #{existing_app["id"]}) — <a href="{BASE}/application/{existing_app["id"]}" style="color:#6ee7b7">View →</a></div>'
+        app_method = existing_app["apply_method"] or ""
+        app_result = existing_app["apply_result"] or ""
+        is_failed = ("failed" in app_method.lower() or "web_url" in app_method.lower() or
+                     "FAILED" in app_result[:80] or "could not handle" in app_result.lower()[:80] or
+                     "manual" in app_result.lower()[:80] or "error" in app_result.lower()[:80])
+
+        if is_failed:
+            apply_html = f"""
+            <div class="alert-warn" style="margin-bottom:15px">
+                ⚠️ Last apply attempt failed (Application #{existing_app["id"]}) — <a href="{BASE}/application/{existing_app["id"]}" style="color:#fcd34d">View details →</a><br>
+                <span style="font-size:12px;color:#94a3b8">{app_result[:120]}</span>
+            </div>
+            <div class="section">
+            <h2>Apply Yourself</h2>
+            <p style="color:#64748b;margin-bottom:10px">The last auto-apply failed, but you can try again. The agent will attempt to login and fill the application form.</p>
+            <button class="btn btn-green" onclick="autoApply()">🎯 Try Again — Apply Now</button>
+            <div id="apply-result"></div>
+            <script>
+            async function autoApply() {{
+            document.getElementById('apply-result').innerHTML = '<span class="spinner"></span> Generating CV & cover letter, then applying...';
+            try {{
+            const resp = await fetch('{BASE}/api/apply/{job_id}', {{method:'POST'}});
+            const data = await resp.json();
+            if (data.success) {{
+            document.getElementById('apply-result').innerHTML = '<div class="alert-ok" style="margin-top:10px">✅ Applied! <a href="{BASE}/application/'+data.app_id+'" style="color:#6ee7b7">View application →</a></div><div style="color:#94a3b8;font-size:12px;margin-top:5px">'+(data.result||'')+'</div>';
+            }} else {{
+            document.getElementById('apply-result').innerHTML = '<div class="alert-warn" style="margin-top:10px">❌ Apply failed: '+(data.result||data.error||'unknown')+'</div>';
+            }}
+            }} catch(e) {{ document.getElementById('apply-result').innerHTML = '<div class="alert-warn">Error: '+e.message+'</div>'; }}
+            }}
+            </script>
+            </div>"""
+        else:
+            apply_html = f'<div class="alert-ok" style="margin-bottom:15px">✓ Already applied (Application #{existing_app["id"]}) — <a href="{BASE}/application/{existing_app["id"]}" style="color:#6ee7b7">View →</a></div>'
     elif profile and eval_result and eval_result.should_auto_apply:
         apply_html = f"""
         <div class="section">
@@ -573,14 +1148,35 @@ async def job_detail_page(job_id: str):
         if (data.success) {{
         document.getElementById('apply-result').innerHTML = '<div class="alert-ok" style="margin-top:10px">✓ Applied! <a href="{BASE}/application/'+data.app_id+'" style="color:#6ee7b7">View application →</a></div>';
         }} else {{
-        document.getElementById('apply-result').innerHTML = '<div class="alert-warn">Error: '+data.error+'</div>';
+        document.getElementById('apply-result').innerHTML = '<div class="alert-warn" style="margin-top:10px">Error: '+(data.result||data.error)+'</div>';
         }}
         }} catch(e) {{ document.getElementById('apply-result').innerHTML = 'Error: '+e.message; }}
         }}
         </script>
         </div>"""
     elif profile:
-        apply_html = f'<div class="alert-warn">Fit score {score} is below your auto-apply threshold ({profile.get("auto_apply_threshold",50)}). <a href="{BASE}/profile">Lower threshold</a> or apply manually.</div>'
+        apply_html = f"""
+        <div class="alert-warn">Fit score {score} is below your auto-apply threshold ({profile.get("auto_apply_threshold",50)}).</div>
+        <div class="section">
+        <h2>Apply Yourself</h2>
+        <p style="color:#64748b;margin-bottom:10px">This job is below your auto-apply threshold, but you can still apply manually. The agent will generate CV + cover letter and attempt to submit the application.</p>
+        <button class="btn btn-green" onclick="autoApply()">🎯 Apply Anyway</button>
+        <div id="apply-result"></div>
+        <script>
+        async function autoApply() {{
+        document.getElementById('apply-result').innerHTML = '<span class="spinner"></span> Generating CV & cover letter, then applying...';
+        try {{
+        const resp = await fetch('{BASE}/api/apply/{job_id}', {{method:'POST'}});
+        const data = await resp.json();
+        if (data.success) {{
+        document.getElementById('apply-result').innerHTML = '<div class="alert-ok" style="margin-top:10px">✅ Applied! <a href="{BASE}/application/'+data.app_id+'" style="color:#6ee7b7">View application →</a></div><div style="color:#94a3b8;font-size:12px;margin-top:5px">'+(data.result||'')+'</div>';
+        }} else {{
+        document.getElementById('apply-result').innerHTML = '<div class="alert-warn" style="margin-top:10px">❌ Apply failed: '+(data.result||data.error||'unknown')+'</div>';
+        }}
+        }} catch(e) {{ document.getElementById('apply-result').innerHTML = '<div class="alert-warn">Error: '+e.message+'</div>'; }}
+        }}
+        </script>
+        </div>"""
 
     # Description
     desc = job.get("description", "") or "No description available."
@@ -843,7 +1439,10 @@ async def api_apply_job(job_id: str):
     try: job_dict["tags"] = json.loads(job.get("tags", "[]"))
     except: job_dict["tags"] = []
     evaluation = evaluate_job(job_dict, profile)
-    result = auto_apply_to_job(job_dict, profile, evaluation)
+    # Run in separate thread — Playwright Sync API can't run inside asyncio loop
+    import asyncio
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, auto_apply_to_job, job_dict, profile, evaluation)
     return JSONResponse(result)
 
 
@@ -876,6 +1475,114 @@ async def api_get_activity(limit: int = 50):
 @app.get("/api/state")
 async def api_get_state():
     return JSONResponse(get_agent_state())
+
+
+@app.get("/api/agent/status")
+async def api_agent_status():
+    """Get the status of the agent loop and persistent browser."""
+    import subprocess
+    
+    # Agent loop status
+    result = subprocess.run(["systemctl", "is-active", "job-agent-loop.service"], capture_output=True, text=True)
+    loop_active = result.stdout.strip() == "active"
+    
+    result = subprocess.run(["systemctl", "is-enabled", "job-agent-loop.service"], capture_output=True, text=True)
+    loop_enabled = "enabled" in result.stdout.strip()
+    
+    # Persistent browser status
+    browser_status = {"running": False, "linkedin_logged_in": False}
+    try:
+        from persistent_browser import get_status as get_browser_status
+        browser_status = get_browser_status()
+    except:
+        pass
+    
+    # Web service status (always active since we're responding)
+    
+    return JSONResponse({
+        "agent_loop": {
+            "active": loop_active,
+            "enabled": loop_enabled,
+        },
+        "persistent_browser": browser_status,
+        "web_service": {"active": True},
+    })
+
+
+@app.post("/api/agent/start")
+async def api_agent_start():
+    """Start the agent loop service."""
+    import subprocess
+    try:
+        # Also start the persistent browser if not running
+        try:
+            from persistent_browser import is_browser_running, start_browser
+            if not is_browser_running():
+                # Start Xvfb first
+                subprocess.run(["pkill", "-f", "Xvfb :99"], capture_output=True)
+                import time
+                subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x900x24"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(2)
+                start_browser()
+        except:
+            pass
+        
+        result = subprocess.run(["systemctl", "start", "job-agent-loop.service"], capture_output=True, text=True)
+        subprocess.run(["systemctl", "enable", "job-agent-loop.service"], capture_output=True)
+        
+        if result.returncode == 0:
+            log_activity("agent_started", "Agent loop started via dashboard")
+            return JSONResponse({"status": "ok", "message": "Agent started. It will scan job sources every 2 minutes."})
+        else:
+            return JSONResponse({"status": "error", "message": result.stderr or "Failed to start agent"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.post("/api/agent/stop")
+async def api_agent_stop():
+    """Stop the agent loop service."""
+    import subprocess
+    try:
+        subprocess.run(["systemctl", "stop", "job-agent-loop.service"], capture_output=True)
+        subprocess.run(["systemctl", "disable", "job-agent-loop.service"], capture_output=True)
+        log_activity("agent_stopped", "Agent loop stopped via dashboard")
+        return JSONResponse({"status": "ok", "message": "Agent stopped. New jobs will not be scanned."})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.post("/api/browser/start")
+async def api_browser_start():
+    """Start the persistent browser."""
+    import subprocess, time
+    try:
+        # Start Xvfb
+        subprocess.run(["pkill", "-f", "Xvfb :99"], capture_output=True)
+        subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x900x24"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        
+        from persistent_browser import start_browser, cleanup_locks
+        cleanup_locks()
+        if start_browser():
+            return JSONResponse({"status": "ok", "message": "Browser started"})
+        else:
+            return JSONResponse({"status": "error", "message": "Failed to start browser"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.post("/api/browser/stop")
+async def api_browser_stop():
+    """Stop the persistent browser."""
+    try:
+        from persistent_browser import stop_browser
+        stop_browser()
+        return JSONResponse({"status": "ok", "message": "Browser stopped"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 @app.get("/whatsapp", response_class=HTMLResponse)

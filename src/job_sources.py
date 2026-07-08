@@ -7,8 +7,15 @@ Scrapes jobs from multiple free sources:
   - WeWorkRemotely (RSS feed)
   - Jobspresso (RSS feed)
   - Freelancer.com (RSS feed)
+  - Jobicy (free JSON API)
+  - Python.org Jobs (RSS feed)
+  - Mustakbil.com (Pakistani jobs, Playwright scraping)
+  - TechJobs.pk (Pakistani tech jobs, Playwright scraping)
+  - JSRemotely / javascript.jobs (remote JS jobs, Playwright)
+  - micro1.ai/refer (AI talent platform, requires account — auto-apply mode)
 
 All sources are free, require no authentication, and return structured data.
+Sources requiring account creation are handled by the auto-apply engine.
 """
 
 import json
@@ -479,6 +486,479 @@ def search_freelancer(keywords: list = None, limit: int = 50) -> list[JobListing
     return jobs[:limit]
 
 
+# --- Jobicy (free JSON API) ---
+
+def search_jobicy(limit: int = 50, query: str = "") -> list[JobListing]:
+    """Fetch remote jobs from Jobicy free API."""
+    try:
+        url = "https://jobicy.com/api/v2/remote-jobs"
+        raw = _fetch(url)
+        if not raw:
+            return []
+        data = json.loads(raw)
+        raw_jobs = data.get("jobs", [])
+        if not isinstance(raw_jobs, list):
+            return []
+
+        jobs = []
+        for item in raw_jobs[:limit]:
+            title = item.get("jobTitle", "")
+            if query and query.lower() not in title.lower() and query.lower() not in (item.get("jobExcerpt", "") or "").lower():
+                continue
+            jobs.append(JobListing(
+                id=f"jobicy_{item.get('id', '')}",
+                source="jobicy",
+                title=title,
+                company=item.get("companyName", ""),
+                location=item.get("jobGeo", "") or "Remote",
+                url=item.get("url", ""),
+                description=_strip_html(item.get("jobDescription", "") or item.get("jobExcerpt", ""))[:5000],
+                apply_url=item.get("url", ""),
+                date=item.get("pubDate", ""),
+                tags=[item.get("jobIndustry", ""), item.get("jobType", "")] if item.get("jobIndustry") else [],
+                salary=""
+            ))
+        return jobs
+    except Exception as e:
+        print(f"  [Jobicy] Error: {e}")
+        return []
+
+
+# --- Python.org Jobs (RSS feed) ---
+
+def search_python_jobs(limit: int = 20) -> list[JobListing]:
+    """Fetch Python-related jobs from python.org RSS feed."""
+    try:
+        raw = _fetch("https://www.python.org/jobs/feed/rss/")
+        if not raw:
+            return []
+
+        root = ET.fromstring(raw)
+        items = root.findall(".//item")
+        jobs = []
+
+        for item in items[:limit]:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            date_elem = item.find("pubDate")
+            author_elem = item.find("author")
+
+            title = title_elem.text if title_elem is not None else ""
+            link = link_elem.text if link_elem is not None else ""
+            desc = _strip_html(desc_elem.text if desc_elem is not None else "")
+            pub_date = date_elem.text if date_elem is not None else ""
+            company = author_elem.text if author_elem is not None else ""
+
+            job_id = re.sub(r"[^a-zA-Z0-9]", "_", link)[-60:]
+
+            jobs.append(JobListing(
+                id=f"pyjobs_{job_id}",
+                source="python_jobs",
+                title=title,
+                company=company,
+                location="Various",
+                url=link,
+                description=desc[:5000],
+                apply_url=link,
+                date=pub_date,
+                tags=["Python"],
+                salary=""
+            ))
+        return jobs
+    except Exception as e:
+        print(f"  [PythonJobs] Error: {e}")
+        return []
+
+
+# --- Mustakbil.com (Pakistani jobs, Playwright) ---
+
+def search_mustakbil(limit: int = 30, query: str = "") -> list[JobListing]:
+    """Scrape Pakistani jobs from Mustakbil.com using Playwright."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  [Mustakbil] Playwright not available")
+        return []
+
+    jobs = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            page = browser.new_page()
+
+            url = "https://www.mustakbil.com/jobs"
+            if query:
+                url += f"?search={urllib.parse.quote(query)}"
+
+            page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            # Find job cards
+            cards = page.query_selector_all(".jobs-grid .job-card, .job-card")
+
+            for card in cards[:limit]:
+                try:
+                    # Title link
+                    title_elem = card.query_selector(".job-card__title")
+                    if not title_elem:
+                        continue
+
+                    href = title_elem.get_attribute("href") or ""
+                    if not href.startswith("http"):
+                        href = "https://www.mustakbil.com" + href
+
+                    title = title_elem.inner_text().strip()
+
+                    # Company — get the span inside, not the icon text
+                    company = ""
+                    company_elem = card.query_selector(".job-card__company span")
+                    if company_elem:
+                        company = company_elem.inner_text().strip()
+
+                    # Location — get the span inside
+                    location = "Pakistan"
+                    location_elem = card.query_selector(".job-card__location span")
+                    if location_elem:
+                        location = location_elem.inner_text().strip()
+
+                    # Date — from footer
+                    date_text = ""
+                    footer = card.query_selector(".job-card__footer-meta")
+                    if footer:
+                        date_text = footer.inner_text().strip()
+
+                    # Job type
+                    job_type = ""
+                    type_elem = card.query_selector(".job-card__footer-meta .badge, .job-card__type")
+                    if type_elem:
+                        job_type = type_elem.inner_text().strip()
+
+                    job_id_match = re.search(r"/jobs/job/(\d+)", href)
+                    job_id = f"mtk_{job_id_match.group(1)}" if job_id_match else f"mtk_{re.sub(r'[^a-zA-Z0-9]', '_', href)[-40:]}"
+
+                    jobs.append(JobListing(
+                        id=job_id,
+                        source="mustakbil",
+                        title=title,
+                        company=company,
+                        location=location,
+                        url=href,
+                        description=f"Job type: {job_type}. Posted: {date_text}",
+                        apply_url=href,
+                        date=date_text,
+                        tags=[job_type] if job_type else [],
+                        salary=""
+                    ))
+                except Exception:
+                    continue
+
+            browser.close()
+    except Exception as e:
+        print(f"  [Mustakbil] Error: {e}")
+
+    return jobs[:limit]
+
+
+# --- TechJobs.pk (Pakistani tech jobs, Playwright) ---
+
+def search_techjobs_pk(limit: int = 30, query: str = "") -> list[JobListing]:
+    """Scrape Pakistani tech jobs from TechJobs.pk using Playwright."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  [TechJobs.pk] Playwright not available")
+        return []
+
+    jobs = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            page = browser.new_page()
+
+            url = "https://techjobs.pk/jobs"
+            if query:
+                url += f"?search={urllib.parse.quote(query)}"
+
+            page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(5000)
+
+            # Scroll to load lazy content
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 800)")
+                page.wait_for_timeout(1000)
+
+            # TechJobs.pk renders job cards as divs with border classes
+            # Each card contains: title, company, location, type, salary, tags
+            cards = page.query_selector_all(".overflow-hidden.rounded-lg.border")
+
+            for card in cards[:limit]:
+                try:
+                    text = card.inner_text()
+                    if len(text) < 20:
+                        continue
+
+                    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+                    # Skip non-job cards
+                    if not lines or any(lines[0] == nav for nav in ["Browse Jobs", "Companies", "Sign In"]):
+                        continue
+
+                    # First line is usually the title (may have company initials prefix)
+                    title = lines[0]
+                    # Remove common prefixes like "ET" (company initials)
+                    if len(title) < 5 and len(lines) > 1:
+                        title = lines[1]
+
+                    company = ""
+                    location = "Pakistan"
+                    job_type = ""
+                    salary = ""
+                    posted = ""
+
+                    for line in lines:
+                        # Company · Location pattern
+                        if "·" in line and not company:
+                            parts = line.split("·")
+                            company = parts[0].strip()
+                            if len(parts) > 1:
+                                location = parts[1].strip()
+                        # Job type
+                        if any(t in line.lower() for t in ["full-time", "part-time", "contract", "freelance", "internship"]):
+                            job_type = line
+                        # Location
+                        if any(c in line.lower() for c in ["lahore", "karachi", "islamabad", "remote", "hybrid", "onsite"]):
+                            if "·" not in line:
+                                location = line
+                        # Salary
+                        if "pkr" in line.lower() or "$" in line:
+                            salary = line
+                        # Posted date
+                        if "posted" in line.lower():
+                            posted = line
+
+                    if not title or len(title) < 3:
+                        continue
+
+                    # Generate ID from title
+                    job_id = f"tjp_{re.sub(r'[^a-zA-Z0-9]', '_', title)[:40]}_{len(jobs)}"
+
+                    jobs.append(JobListing(
+                        id=job_id,
+                        source="techjobs_pk",
+                        title=title,
+                        company=company,
+                        location=location,
+                        url=f"https://techjobs.pk/jobs?search={urllib.parse.quote(title[:30])}",
+                        description=f"Job type: {job_type}. Salary: {salary}. Location: {location}. {posted}",
+                        apply_url=f"https://techjobs.pk/jobs",
+                        date=posted,
+                        tags=[job_type] if job_type else [],
+                        salary=salary
+                    ))
+                except Exception:
+                    continue
+
+            browser.close()
+    except Exception as e:
+        print(f"  [TechJobs.pk] Error: {e}")
+
+    return jobs[:limit]
+
+
+# --- JSRemotely / javascript.jobs (Playwright) ---
+
+def search_jsremotely(limit: int = 30) -> list[JobListing]:
+    """Scrape remote JavaScript jobs from JSRemotely using Playwright."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  [JSRemotely] Playwright not available")
+        return []
+
+    jobs = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            page = browser.new_page()
+
+            page.goto("https://jsremotely.com", timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            # JSRemotely has job links with /job/ in href
+            # The link text format is: "Title\n4D\nFull Time\nRemote\nCompany\nCountry"
+            job_links = page.query_selector_all("a[href*='/job/']")
+
+            seen_hrefs = set()
+            for link in job_links[:limit * 2]:  # get extra to account for dups
+                try:
+                    href = link.get_attribute("href") or ""
+                    if not href.startswith("http"):
+                        href = "https://jsremotely.com" + href
+
+                    if href in seen_hrefs:
+                        continue
+                    seen_hrefs.add(href)
+
+                    # Parse the link text: "Title\n4D\nFull Time\nRemote\nCompany\nCountry"
+                    raw_text = link.inner_text().strip()
+                    lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+
+                    if not lines:
+                        continue
+
+                    title = lines[0]
+                    if len(title) < 3:
+                        continue
+
+                    # Parse metadata from remaining lines
+                    company = ""
+                    location = "Remote"
+                    job_type = ""
+                    salary = ""
+                    date_text = ""
+
+                    for line in lines[1:]:
+                        if re.match(r'^\d+[DMWYh]', line):
+                            date_text = line
+                        elif any(t in line.lower() for t in ["full time", "part time", "contract", "freelance"]):
+                            job_type = line
+                        elif line.lower() in ["remote", "worldwide"]:
+                            location = "Remote"
+                        elif any(c in line.lower() for c in ["pakistan", "india", "usa", "europe", "brazil", "canada", "germany", "uk"]):
+                            location = line
+                        elif "$" in line and "salary" in line.lower():
+                            salary = line
+                        elif not company and not re.match(r'^\d+[DMWYh]', line) and \
+                             not any(t in line.lower() for t in ["remote", "time", "salary", "full", "part", "contract", "freelance"]):
+                            company = line
+
+                    job_id = f"jsr_{re.sub(r'[^a-zA-Z0-9]', '_', href.split('/job/')[-1])[-40:]}"
+
+                    jobs.append(JobListing(
+                        id=job_id,
+                        source="jsremotely",
+                        title=title,
+                        company=company,
+                        location=location,
+                        url=href,
+                        description=f"Job type: {job_type}. Salary: {salary}",
+                        apply_url=href,
+                        date=date_text,
+                        tags=["JavaScript", "Remote"] + ([job_type] if job_type else []),
+                        salary=salary
+                    ))
+                except Exception:
+                    continue
+
+            browser.close()
+    except Exception as e:
+        print(f"  [JSRemotely] Error: {e}")
+
+    return jobs[:limit]
+
+
+# --- micro1.ai/refer (AI talent platform) ---
+# This platform requires login. Jobs are discovered through the auto-apply engine
+# which can create an account and browse/apply to matching positions.
+
+def search_micro1(profile: dict) -> list[JobListing]:
+    """
+    Search micro1.ai referral platform for AI/tech jobs.
+    Requires account — if no account exists, returns empty (auto-apply engine will handle).
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    # Check if we have stored credentials
+    import sqlite3
+    from pathlib import Path
+    db_path = Path(__file__).parent / "data" / "jobagent.db"
+    if not db_path.exists():
+        return []
+
+    db = sqlite3.connect(str(db_path))
+    db.row_factory = sqlite3.Row
+    # Check for stored micro1 credentials
+    try:
+        row = db.execute("SELECT value FROM settings WHERE key = 'micro1_credentials'").fetchone()
+    except Exception:
+        db.close()
+        return []
+
+    if not row:
+        db.close()
+        return []
+
+    creds = json.loads(row["value"])
+    db.close()
+
+    jobs = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            page = browser.new_page()
+
+            # Login to micro1
+            page.goto("https://refer.micro1.ai/", timeout=20000, wait_until="networkidle")
+            page.wait_for_timeout(3000)
+
+            # Fill login form
+            email_input = page.query_selector("input[type='email']")
+            if email_input:
+                email_input.fill(creds.get("email", ""))
+                page.wait_for_timeout(500)
+
+                # Click continue
+                continue_btn = page.query_selector("button:has-text('Continue')")
+                if continue_btn:
+                    continue_btn.click()
+                    page.wait_for_timeout(3000)
+
+            # Look for job listings
+            page.wait_for_timeout(3000)
+            cards = page.query_selector_all("[class*='job'], [class*='position'], [class*='card']")
+
+            for card in cards[:30]:
+                try:
+                    link_elem = card.query_selector("a")
+                    if not link_elem:
+                        continue
+
+                    href = link_elem.get_attribute("href") or ""
+                    title = link_elem.inner_text().strip()
+                    text = card.inner_text()
+
+                    if not title or len(title) < 3:
+                        continue
+
+                    job_id = f"micro1_{re.sub(r'[^a-zA-Z0-9]', '_', href)[-40:]}"
+
+                    jobs.append(JobListing(
+                        id=job_id,
+                        source="micro1",
+                        title=title,
+                        company="micro1",
+                        location="Remote",
+                        url=href if href.startswith("http") else f"https://refer.micro1.ai{href}",
+                        description=text[:2000],
+                        apply_url=href if href.startswith("http") else f"https://refer.micro1.ai{href}",
+                        date="",
+                        tags=["AI", "Remote"],
+                        salary=""
+                    ))
+                except Exception:
+                    continue
+
+            browser.close()
+    except Exception as e:
+        print(f"  [micro1] Error: {e}")
+
+    return jobs
+
+
 # --- LinkedIn detail fetch ---
 
 def fetch_linkedin_detail(job_id: str) -> str:
@@ -602,6 +1082,42 @@ def scrape_all_jobs(
     flc_jobs = search_freelancer(keywords=freelancer_keywords, limit=max_per_source)
     print(f"    -> Found {len(flc_jobs)} jobs")
     all_jobs.extend(flc_jobs)
+
+    # 7. Jobicy
+    print("  [Jobicy] Fetching...")
+    jobicy_jobs = search_jobicy(limit=max_per_source, query=search_query)
+    print(f"    -> Found {len(jobicy_jobs)} jobs")
+    all_jobs.extend(jobicy_jobs)
+
+    # 8. Python.org Jobs
+    print("  [PythonJobs] Fetching RSS...")
+    pyjobs = search_python_jobs(limit=20)
+    print(f"    -> Found {len(pyjobs)} jobs")
+    all_jobs.extend(pyjobs)
+
+    # 9. Mustakbil.com (Pakistani jobs)
+    print("  [Mustakbil] Scraping Pakistani jobs...")
+    mtk_jobs = search_mustakbil(limit=max_per_source, query=search_query)
+    print(f"    -> Found {len(mtk_jobs)} jobs")
+    all_jobs.extend(mtk_jobs)
+
+    # 10. TechJobs.pk (Pakistani tech jobs)
+    print("  [TechJobs.pk] Scraping Pakistani tech jobs...")
+    tjp_jobs = search_techjobs_pk(limit=max_per_source, query=search_query)
+    print(f"    -> Found {len(tjp_jobs)} jobs")
+    all_jobs.extend(tjp_jobs)
+
+    # 11. JSRemotely (Remote JS jobs)
+    print("  [JSRemotely] Scraping remote JS jobs...")
+    jsr_jobs = search_jsremotely(limit=max_per_source)
+    print(f"    -> Found {len(jsr_jobs)} jobs")
+    all_jobs.extend(jsr_jobs)
+
+    # 12. micro1.ai (if credentials available)
+    print("  [micro1.ai] Checking...")
+    micro1_jobs = search_micro1(profile)
+    print(f"    -> Found {len(micro1_jobs)} jobs")
+    all_jobs.extend(micro1_jobs)
 
     # Filter by date — only keep jobs posted within max_age_days
     if max_age_days > 0:
