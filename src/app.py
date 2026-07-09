@@ -1052,99 +1052,417 @@ fetch('{BASE}/api/login-browser/status')
 
 
 @app.get("/jobs", response_class=HTMLResponse)
-async def jobs_page(status: str = ""):
-    jobs = get_all_jobs(limit=100, status=status if status != "all" else None)
+async def jobs_page(status: str = "", q: str = ""):
+    db = get_db()
+    where = []
+    params = []
+    if status and status != "all":
+        where.append("status = ?")
+        params.append(status)
+    if q:
+        where.append("(title LIKE ? OR company LIKE ? OR location LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
+    where_clause = " WHERE " + " AND ".join(where) if where else ""
+    jobs = db.execute(f"SELECT * FROM jobs{where_clause} ORDER BY fit_score DESC, first_seen DESC LIMIT 200", params).fetchall()
+    db.close()
+    jobs = [dict(j) for j in jobs]
 
-    rows_html = ""
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) as c FROM jobs").fetchone()["c"]
+    stats = {
+        "total": total,
+        "applied": db.execute("SELECT COUNT(*) as c FROM jobs WHERE status='applied'").fetchone()["c"],
+        "new": db.execute("SELECT COUNT(*) as c FROM jobs WHERE status='new'").fetchone()["c"],
+        "high_fit": db.execute("SELECT COUNT(*) as c FROM jobs WHERE fit_score >= 50").fetchone()["c"],
+    }
+    stats["applied_count"] = db.execute("SELECT COUNT(*) as c FROM applications WHERE apply_method='linkedin_easy_apply'").fetchone()["c"]
+    db.close()
+
+    # Build job cards
+    cards_parts = []
     for j in jobs:
-        verdict = j.get("verdict", "")
-        badge_class = "fit-strong" if "Strong" in verdict else "fit-good" if "Good" in verdict else "fit-moderate" if "Moderate" in verdict else "fit-weak" if "Weak" in verdict else "fit-good"
-        score = j.get("fit_score", 0)
+        jid = j["id"]
+        title = j.get("title", "N/A")
+        company = j.get("company", "—")
+        location = j.get("location", "—")
+        source = j.get("source", "")
+        score = j.get("fit_score", 0) or 0
         job_status = j.get("status", "new")
-        status_class = f"status-{job_status}"
+        url = j.get("url", "") or ""
+        desc = (j.get("description", "") or "")[:200]
+        salary = j.get("salary", "") or ""
 
-        tags_str = ""
+        if score >= 60: score_color = "#10b981"
+        elif score >= 40: score_color = "#3b82f6"
+        elif score >= 25: score_color = "#f59e0b"
+        else: score_color = "#ef4444"
+
+        status_colors = {
+            "applied": ("#065f46", "#6ee7b7"),
+            "new": ("#1e3a5f", "#93c5fd"),
+            "evaluated": ("#334155", "#cbd5e1"),
+            "apply_failed": ("#7f1d1d", "#fca5a5"),
+            "apply_skipped": ("#475569", "#94a3b8"),
+        }
+        sc_bg, sc_fg = status_colors.get(job_status, ("#334155", "#cbd5e1"))
+
+        if source == "linkedin":
+            source_badge = "<span style='color:#0a66c2;font-size:11px;font-weight:600'>LinkedIn</span>"
+        elif source == "freelancer":
+            source_badge = "<span style='color:#15a3f5;font-size:11px;font-weight:600'>Freelancer</span>"
+        else:
+            source_badge = f"<span style='color:#64748b;font-size:11px;font-weight:600'>{source}</span>"
+
+        db2 = get_db()
+        existing = db2.execute("SELECT id, apply_method FROM applications WHERE job_id = ? ORDER BY id DESC LIMIT 1", (jid,)).fetchone()
+        db2.close()
+        already_applied = existing and "failed" not in (existing["apply_method"] or "").lower()
+
+        if source == "freelancer":
+            action_btn = f"""<button class="btn btn-green" style="font-size:12px;padding:6px 14px" onclick="openBidModal('{jid}', this)">Place Bid</button>"""
+        elif already_applied:
+            action_btn = f"""<a href="{BASE}/application/{existing["id"]}" class="btn" style="font-size:12px;padding:6px 14px;background:#065f46">Applied</a>"""
+        else:
+            action_btn = f"""<button class="btn btn-green" style="font-size:12px;padding:6px 14px" onclick="openApplyModal('{jid}', this)">Apply</button>"""
+
+        skills_html = ""
         try:
-            tags = json.loads(j.get("tags", "[]"))
-            if tags:
-                tags_str = " ".join(f"<span style='color:#475569;font-size:11px'>{t}</span>" for t in tags[:3])
+            matched = json.loads(j.get("matched_skills", "[]"))
+            if matched:
+                skills_html = "<div style='margin-top:6px'>" + "".join(
+                    f"<span style='background:#1e3a5f;color:#93c5fd;padding:2px 8px;border-radius:10px;font-size:10px;margin-right:4px'>{s}</span>"
+                    for s in matched[:5]
+                ) + "</div>"
         except:
             pass
 
-        rows_html += f"""
-        <tr>
-        <td><a href="{BASE}/job/{j['id']}">{j.get('title','N/A')}</a></td>
-        <td>{j.get('company','—')}</td>
-        <td>{j.get('location','—')}</td>
-        <td><span class="badge {badge_class}">{verdict} ({score:.0f})</span></td>
-        <td><span class="badge {status_class}">{job_status}</span></td>
-        <td style="font-size:11px;color:#475569">{j.get('source','')}</td>
-        <td><button class="btn btn-green" style="font-size:11px;padding:3px 10px" onclick="applyNow('{j['id']}', this)">🎯 Apply</button></td>
-        </tr>"""
+        salary_html = f"<span style='color:#6ee7b7;font-size:12px;margin-left:8px'>{salary}</span>" if salary else ""
 
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Jobs — Job Agent</title>
-<style>{CSS}</style></head><body>
-{nav('jobs')}
-<div class="container">
-<h1>Discovered Jobs ({len(jobs)})</h1>
-<p class="subtitle">All jobs the agent has found and evaluated</p>
+        card = (
+               f"<div class='job-card'>"
+            + f"<div style='display:flex;justify-content:space-between;align-items:flex-start;gap:12px'>"
+            + f"<div style='flex:1;min-width:0'>"
+            + f"<div style='display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px'>"
+            + f"{source_badge}"
+            + f"<span style='background:{sc_bg};color:{sc_fg};padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600'>{job_status}</span>"
+            + f"</div>"
+            + f"<a href='{BASE}/job/{jid}' style='font-size:15px;font-weight:700;color:#f1f5f9;text-decoration:none'>{title}</a>"
+            + f"<div style='color:#94a3b8;font-size:13px;margin-top:2px'>{company} - {location} {salary_html}</div>"
+            + f"</div>"
+            + f"<div style='text-align:center;flex-shrink:0'>"
+            + f"<div style='font-size:22px;font-weight:800;color:{score_color}'>{score:.0f}</div>"
+            + f"<div style='font-size:10px;color:#475569;text-transform:uppercase'>Fit Score</div>"
+            + f"</div>"
+            + f"</div>"
+            + f"<div style='color:#64748b;font-size:12px;margin-top:8px;line-height:1.4;max-height:40px;overflow:hidden'>{desc}...</div>"
+            + f"{skills_html}"
+            + f"<div style='display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;align-items:center'>"
+            + f"{action_btn}"
+            + f'<button class="btn btn-sec" style="font-size:12px;padding:6px 12px" onclick="genDoc(\'{jid}\', \'cv\')">View CV</button>'
+            + f'<button class="btn btn-sec" style="font-size:12px;padding:6px 12px" onclick="genDoc(\'{jid}\', \'cover\')">Cover Letter</button>'
+            + f"<a href='{url}' target='_blank' class='btn btn-sec' style='font-size:12px;padding:6px 12px'>Open Job</a>"
+            + f"</div>"
+            + f"</div>"
+        )
+        cards_parts.append(card)
 
-<div style="margin-bottom:15px">
-<a href="{BASE}/jobs" class="btn btn-sec" style="font-size:12px;padding:5px 12px">All</a>
-<a href="{BASE}/jobs?status=new" class="btn btn-sec" style="font-size:12px;padding:5px 12px">New</a>
-<a href="{BASE}/jobs?status=evaluated" class="btn btn-sec" style="font-size:12px;padding:5px 12px">Evaluated</a>
-<a href="{BASE}/jobs?status=applied" class="btn btn-sec" style="font-size:12px;padding:5px 12px">Applied</a>
-<a href="{BASE}/jobs?status=apply_failed" class="btn btn-sec" style="font-size:12px;padding:5px 12px">Failed</a>
-</div>
+    cards_html = "\n".join(cards_parts)
 
-{"<table><tr><th>Title</th><th>Company</th><th>Location</th><th>Fit</th><th>Status</th><th>Source</th><th>Action</th></tr>" + rows_html + "</table>" if jobs else "<div class='alert'>No jobs discovered yet. Run the agent from the dashboard.</div>"}
+    f_all = "active" if not status else ""
+    f_new = "active" if status == "new" else ""
+    f_eval = "active" if status == "evaluated" else ""
+    f_applied = "active" if status == "applied" else ""
+    f_failed = "active" if status == "apply_failed" else ""
+    f_skipped = "active" if status == "apply_skipped" else ""
 
-<div id="apply-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center">
-<div style="background:#1e293b;border-radius:12px;padding:30px;max-width:500px;width:90%;text-align:center">
-<h2 id="apply-modal-title" style="color:#f1f5f9">Applying...</h2>
-<p id="apply-modal-msg" style="color:#94a3b8;margin:15px 0">Generating CV & cover letter, then applying...</p>
-<div id="apply-modal-result"></div>
-<button onclick="closeModal()" style="margin-top:15px;background:#334155;color:#cbd5e1;border:none;padding:8px 20px;border-radius:6px;cursor:pointer">Close</button>
-</div>
-</div>
+    jobs_or_empty = (
+        f"<div class='jobs-grid'>{cards_html}</div>" if jobs
+        else "<div class='alert'>No jobs found. Run the agent from the dashboard to discover jobs.</div>"
+    )
 
+    extra_css = (
+        ".job-card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:12px;transition:.2s}"
+        ".job-card:hover{border-color:#3b82f6;box-shadow:0 4px 12px rgba(59,130,246,.1)}"
+        ".search-box{display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap}"
+        ".filter-bar{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}"
+        ".filter-bar a{padding:6px 14px;border-radius:8px;font-size:13px;text-decoration:none;background:#334155;color:#cbd5e1;transition:.2s}"
+        ".filter-bar a:hover{background:#475569;color:#fff}"
+        ".filter-bar a.active{background:#3b82f6;color:#fff}"
+        ".stat-pill{display:inline-flex;align-items:center;gap:6px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 14px;font-size:13px}"
+        ".stat-pill .num{font-weight:800;font-size:18px}"
+        ".stat-pill .lbl{color:#64748b;font-size:11px;text-transform:uppercase}"
+        ".modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center}"
+        ".modal-box{background:#1e293b;border-radius:12px;padding:30px;max-width:550px;width:90%;max-height:85vh;overflow-y:auto}"
+        ".doc-viewer{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.8);z-index:9999;align-items:center;justify-content:center}"
+        ".doc-viewer-box{background:#0f172a;border:1px solid #334155;border-radius:12px;padding:25px;max-width:650px;width:90%;max-height:85vh;overflow-y:auto}"
+        ".doc-viewer-box pre{white-space:pre-wrap;font-size:13px;line-height:1.6;color:#cbd5e1;font-family:monospace}"
+    )
+
+    js = f"""
 <script>
-function applyNow(jobId, btn) {{
+var BASE = '{BASE}';
+function closeModal(modalId) {{ document.getElementById(modalId).style.display = 'none'; }}
+function openApplyModal(jobId, btn) {{
     var modal = document.getElementById('apply-modal');
     var msg = document.getElementById('apply-modal-msg');
     var result = document.getElementById('apply-modal-result');
     modal.style.display = 'flex';
-    msg.innerHTML = '<span class="spinner"></span> Generating CV & cover letter, then attempting to apply...';
+    msg.innerHTML = '<span class="spinner"></span> Generating CV and applying...';
     result.innerHTML = '';
-    btn.disabled = true;
-    btn.innerHTML = '⏳ Applying...';
-    fetch('{BASE}/api/apply/' + jobId, {{method:'POST'}})
+    if (btn) {{ btn.disabled = true; btn.innerHTML = 'Applying...'; }}
+    fetch(BASE + '/api/apply/' + jobId, {{method:'POST'}})
     .then(r => r.json())
     .then(data => {{
-        btn.disabled = false;
-        btn.innerHTML = '🎯 Apply';
+        if (btn) {{ btn.disabled = false; btn.innerHTML = 'Apply'; }}
         if (data.success) {{
             msg.innerHTML = '';
-            result.innerHTML = '<div style="color:#6ee7b7;font-size:15px">✅ Applied successfully!</div><div style="color:#94a3b8;font-size:13px;margin-top:8px">' + (data.result || '') + '</div><a href="{BASE}/application/' + data.app_id + '" class="btn" style="margin-top:15px">View Application →</a>';
+            result.innerHTML = '<div style="color:#6ee7b7;font-size:15px">Applied successfully!</div><div style="color:#94a3b8;font-size:13px;margin-top:8px">' + (data.result || '') + '</div><a href="' + BASE + '/application/' + data.app_id + '" class="btn" style="margin-top:15px">View Application</a>';
         }} else {{
             msg.innerHTML = '';
-            result.innerHTML = '<div style="color:#fca5a5;font-size:15px">❌ Apply failed</div><div style="color:#94a3b8;font-size:13px;margin-top:8px">' + (data.result || data.error || 'Unknown error') + '</div>';
+            result.innerHTML = '<div style="color:#fca5a5;font-size:15px">Apply failed</div><div style="color:#94a3b8;font-size:13px;margin-top:8px">' + (data.result || data.error || 'Unknown error') + '</div>';
         }}
     }})
     .catch(e => {{
-        btn.disabled = false;
-        btn.innerHTML = '🎯 Apply';
+        if (btn) {{ btn.disabled = false; btn.innerHTML = 'Apply'; }}
         msg.innerHTML = '';
         result.innerHTML = '<div style="color:#fca5a5">Error: ' + e.message + '</div>';
     }});
 }}
-function closeModal() {{
-    document.getElementById('apply-modal').style.display = 'none';
+var currentDoc = '', currentDocType = '';
+function genDoc(jobId, type) {{
+    var modal = document.getElementById('doc-modal');
+    var title = document.getElementById('doc-title');
+    var content = document.getElementById('doc-content');
+    modal.style.display = 'flex';
+    title.innerHTML = type === 'cv' ? 'CV / Resume' : 'Cover Letter';
+    content.innerHTML = '<span class="spinner"></span> Generating with AI...';
+    currentDocType = type;
+    fetch(BASE + '/job/' + jobId + '/' + (type === 'cv' ? 'cv' : 'cover'))
+    .then(r => r.text()).then(text => {{ currentDoc = text; content.textContent = text; }})
+    .catch(e => {{ content.textContent = 'Error: ' + e.message; }});
+}}
+function copyDoc() {{ navigator.clipboard.writeText(currentDoc).then(() => alert('Copied!')); }}
+function downloadDoc() {{
+    var blob = new Blob([currentDoc], {{type:'text/plain'}});
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = currentDocType === 'cv' ? 'CV.txt' : 'Cover_Letter.txt'; a.click();
+}}
+var currentBidJobId = '';
+function openBidModal(jobId, btn) {{
+    var modal = document.getElementById('bid-modal');
+    var loading = document.getElementById('bid-loading');
+    var result = document.getElementById('bid-result');
+    modal.style.display = 'flex'; loading.style.display = 'block'; result.style.display = 'none';
+    currentBidJobId = jobId;
+    fetch(BASE + '/api/job/' + jobId + '/bid', {{method:'POST'}})
+    .then(r => r.json()).then(data => {{
+        loading.style.display = 'none'; result.style.display = 'block';
+        if (data.proposal) {{
+            document.getElementById('bid-text').value = data.proposal;
+            if (data.suggested_bid) document.getElementById('bid-amount').value = data.suggested_bid;
+            if (data.suggested_days) document.getElementById('bid-days').value = data.suggested_days;
+            if (data.job_url) document.getElementById('bid-open-link').href = data.job_url;
+        }} else {{ document.getElementById('bid-text').value = 'Error: ' + (data.error || 'Could not generate'); }}
+    }})
+    .catch(e => {{ loading.style.display = 'none'; result.style.display = 'block'; document.getElementById('bid-text').value = 'Error: ' + e.message; }});
+}}
+function copyBid() {{ navigator.clipboard.writeText(document.getElementById('bid-text').value).then(() => alert('Copied!')); }}
+function submitBid() {{
+    var amount = document.getElementById('bid-amount').value;
+    var days = document.getElementById('bid-days').value;
+    var text = document.getElementById('bid-text').value;
+    var resultDiv = document.getElementById('bid-submit-result');
+    if (!amount || !text) {{ resultDiv.innerHTML = '<div style="color:#fca5a5">Fill in amount and proposal</div>'; return; }}
+    resultDiv.innerHTML = '<span class="spinner"></span> Submitting...';
+    fetch(BASE + '/api/job/' + currentBidJobId + '/bid/submit', {{
+        method: 'POST', headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify({{amount:amount, days:days, proposal:text}})
+    }})
+    .then(r => r.json()).then(data => {{
+        resultDiv.innerHTML = data.success ? '<div style="color:#6ee7b7">' + data.message + '</div>' : '<div style="color:#fca5a5">' + (data.error || data.message || 'Failed') + '</div>';
+    }})
+    .catch(e => {{ resultDiv.innerHTML = '<div style="color:#fca5a5">Error: ' + e.message + '</div>'; }});
 }}
 </script>
+"""
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jobs Dashboard - AI Job Agent</title>
+<style>{CSS}
+{extra_css}
+</style></head><body>
+{nav('jobs')}
+<div class="container" style="max-width:1100px">
+<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+<div>
+<h1>Jobs Dashboard</h1>
+<p class="subtitle">All discovered jobs - Generate CV and Cover Letter - Apply with one click</p>
+</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<div class="stat-pill"><span class="num" style="color:#3b82f6">{stats['total']}</span><span class="lbl">Total</span></div>
+<div class="stat-pill"><span class="num" style="color:#6ee7b7">{stats['applied_count']}</span><span class="lbl">Applied</span></div>
+<div class="stat-pill"><span class="num" style="color:#10b981">{stats['high_fit']}</span><span class="lbl">High Fit</span></div>
+<div class="stat-pill"><span class="num" style="color:#f59e0b">{stats['new']}</span><span class="lbl">New</span></div>
+</div>
+</div>
+
+<form method="GET" action="{BASE}/jobs" class="search-box" style="margin-top:20px">
+<input type="text" name="q" placeholder="Search jobs by title, company, or location..." value="{q}" style="flex:1;min-width:250px"/>
+<button type="submit" class="btn">Search</button>
+</form>
+
+<div class="filter-bar">
+<a href="{BASE}/jobs" class="{f_all}">All ({stats['total']})</a>
+<a href="{BASE}/jobs?status=new" class="{f_new}">New</a>
+<a href="{BASE}/jobs?status=evaluated" class="{f_eval}">Evaluated</a>
+<a href="{BASE}/jobs?status=applied" class="{f_applied}">Applied</a>
+<a href="{BASE}/jobs?status=apply_failed" class="{f_failed}">Failed</a>
+<a href="{BASE}/jobs?status=apply_skipped" class="{f_skipped}">Skipped</a>
+</div>
+
+{jobs_or_empty}
+
+<div id="apply-modal" class="modal-overlay">
+<div class="modal-box">
+<h2>Applying...</h2>
+<p id="apply-modal-msg" style="color:#94a3b8;margin:15px 0">Generating CV and applying...</p>
+<div id="apply-modal-result"></div>
+<button onclick="closeModal('apply-modal')" style="margin-top:15px;background:#334155;color:#cbd5e1;border:none;padding:8px 20px;border-radius:6px;cursor:pointer">Close</button>
+</div>
+</div>
+
+<div id="bid-modal" class="modal-overlay">
+<div class="modal-box">
+<h2>Freelancer Bid / Proposal</h2>
+<p id="bid-modal-jobinfo" style="color:#94a3b8;margin-bottom:15px"></p>
+<div id="bid-loading"><span class="spinner"></span> <span style="color:#94a3b8">Generating AI proposal...</span></div>
+<div id="bid-result" style="display:none">
+<label>Bid Amount ($)</label>
+<input type="number" id="bid-amount" placeholder="500" style="margin-bottom:10px"/>
+<label>Delivery Time (days)</label>
+<input type="number" id="bid-days" placeholder="7" style="margin-bottom:10px"/>
+<label>Proposal / Cover Letter</label>
+<textarea id="bid-text" style="min-height:200px;font-family:monospace"></textarea>
+<div style="display:flex;gap:10px;margin-top:15px;flex-wrap:wrap">
+<button class="btn btn-green" onclick="submitBid()">Submit Bid</button>
+<button class="btn btn-sec" onclick="copyBid()">Copy Text</button>
+<a id="bid-open-link" href="#" target="_blank" class="btn btn-sec">Open Job</a>
+</div>
+<div id="bid-submit-result" style="margin-top:10px"></div>
+</div>
+<button onclick="closeModal('bid-modal')" style="margin-top:15px;background:#334155;color:#cbd5e1;border:none;padding:8px 20px;border-radius:6px;cursor:pointer">Close</button>
+</div>
+</div>
+
+<div id="doc-modal" class="doc-viewer">
+<div class="doc-viewer-box">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
+<h2 id="doc-title" style="font-size:18px">Document</h2>
+<div style="display:flex;gap:8px">
+<button class="btn btn-sec" style="font-size:12px;padding:5px 12px" onclick="copyDoc()">Copy</button>
+<button class="btn btn-sec" style="font-size:12px;padding:5px 12px" onclick="downloadDoc()">Download</button>
+<button onclick="closeModal('doc-modal')" style="background:#334155;color:#cbd5e1;border:none;padding:5px 15px;border-radius:6px;cursor:pointer;font-size:14px">X</button>
+</div>
+</div>
+<pre id="doc-content"></pre>
+</div>
+</div>
+
+{js}
 </div></body></html>"""
+
+
+@app.post("/api/job/{job_id}/bid")
+async def api_generate_bid(job_id: str):
+    """Generate an AI freelancer bid/proposal for a job."""
+    job = get_job(job_id)
+    if not job:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    profile = get_profile()
+    if not profile:
+        return JSONResponse({"error": "Profile not set up. Go to Profile page first."}, status_code=400)
+
+    job_dict = dict(job)
+    try: job_dict["tags"] = json.loads(job.get("tags", "[]"))
+    except: job_dict["tags"] = []
+
+    try:
+        title = job_dict.get("title", "")
+        company = job_dict.get("company", "")
+        desc = job_dict.get("description", "")[:1500]
+        skills = ", ".join(profile.get("skills", [])[:10])
+        name = profile.get("name", "Candidate")
+        exp = profile.get("experience", "")
+
+        from ai_engine import _ai_chat_post
+        prompt_msg = {"role": "user", "content": f"""Write a compelling freelancer bid/proposal for this job. Make it professional, concise, and tailored.
+
+Job Title: {title}
+Company: {company}
+Job Description: {desc}
+
+Candidate Name: {name}
+Skills: {skills}
+Experience: {exp}
+
+The proposal should:
+1. Start with a strong hook showing understanding of the project
+2. Highlight relevant experience and skills
+3. Mention specific approach to the project
+4. Include a call to action
+5. Be 150-250 words, professional tone
+
+Write ONLY the proposal text, no headers or meta commentary."""}
+
+        proposal = _ai_chat_post([prompt_msg], timeout=60)
+
+        suggested_bid = 500
+        suggested_days = 7
+        if "senior" in title.lower() or "lead" in title.lower():
+            suggested_bid = 1500
+            suggested_days = 14
+        elif "full stack" in title.lower() or "fullstack" in title.lower():
+            suggested_bid = 800
+            suggested_days = 10
+
+        return JSONResponse({
+            "proposal": proposal.strip(),
+            "suggested_bid": suggested_bid,
+            "suggested_days": suggested_days,
+            "job_title": title,
+            "job_url": job_dict.get("url", "")
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/job/{job_id}/bid/submit")
+async def api_submit_bid(job_id: str, data: dict):
+    """Submit a freelancer bid (saves to DB)."""
+    job = get_job(job_id)
+    if not job:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    amount = data.get("amount", "")
+    days = data.get("days", "")
+    proposal = data.get("proposal", "")
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO applications (job_id, apply_method, apply_result, status) VALUES (?, ?, ?, ?)",
+        (job_id, f"freelancer_bid_${amount}", f"Bid: ${amount} in {days} days\n\n{proposal[:500]}", "applied")
+    )
+    db.execute("UPDATE jobs SET status='applied' WHERE id=?", (job_id,))
+    db.commit()
+    db.close()
+
+    return JSONResponse({
+        "success": True,
+        "message": f"Bid saved! Amount: ${amount}, Days: {days}. Open the job on Freelancer.com to submit manually."
+    })
+
+
 
 
 @app.get("/job/{job_id}", response_class=HTMLResponse)
