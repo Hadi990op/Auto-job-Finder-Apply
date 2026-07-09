@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Agent — Persistent Gmail Browser (session)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/venv-jobagent/bin/python /opt/job-agent/gmail_login.py start
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/opt/job-agent
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:98
+
+[Install]
+WantedBy=multi-user.target

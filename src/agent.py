@@ -55,8 +55,10 @@ DATA_DIR.mkdir(exist_ok=True)
 # --- Database ---
 
 def get_db():
-    db = sqlite3.connect(str(DB_PATH))
+    db = sqlite3.connect(str(DB_PATH), timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA busy_timeout = 30000")
     db.execute("PRAGMA foreign_keys = ON")
     return db
 
@@ -611,7 +613,7 @@ def auto_apply_to_job(job: dict, profile: dict, evaluation: EvaluationResult) ->
     # Determine if this was a real success or a failure
     is_real_success = apply_method in ("email", "web_auto", "web_auto_greenhouse", "web_auto_lever",
                                         "web_auto_workable", "web_auto_linkedin", "web_auto_mustakbil",
-                                        "web_auto_techjobs_pk", "web_auto_form") or \
+                                        "web_auto_techjobs_pk", "web_auto_form", "linkedin_easy_apply") or \
                       (apply_method == "recorded")
 
     app_id = create_application(
@@ -741,36 +743,136 @@ def _solve_captcha_if_needed(page, url: str) -> bool:
     return False
 
 
-def _connect_persistent_browser():
-    """Try to connect to the persistent browser via CDP. Returns (browser, page, is_persistent) or (None, None, False)."""
+def _fix_linkedin_cookies(ctx):
+    """Copy li_at and other session cookies from .www.linkedin.com to .linkedin.com
+    so they work across all LinkedIn subdomains (de, uk, in, etc.)."""
+    try:
+        cookies = ctx.cookies()
+        li_at = None
+        other_session = {}
+        for c in cookies:
+            if c.get("name") == "li_at" and "linkedin" in c.get("domain", ""):
+                li_at = c
+            if c.get("domain") == ".www.linkedin.com":
+                other_session[c["name"]] = c
+        
+        if not li_at:
+            return False
+        
+        # Check if li_at is already on .linkedin.com domain
+        has_global = any(
+            c.get("name") == "li_at" and c.get("domain") == ".linkedin.com"
+            for c in cookies
+        )
+        
+        if not has_global:
+            # Copy li_at to .linkedin.com (applies to all subdomains)
+            new_cookies = []
+            for name in ["li_at", "li_rm", "JSESSIONID", "bscookie"]:
+                if name in other_session:
+                    c = other_session[name].copy()
+                    c["domain"] = ".linkedin.com"
+                    new_cookies.append(c)
+            if new_cookies:
+                ctx.add_cookies(new_cookies)
+                print(f"  [AutoApply] Copied {len(new_cookies)} session cookies to .linkedin.com (global)")
+            return True
+        return True
+    except Exception as e:
+        print(f"  [AutoApply] Cookie fix error: {e}")
+        return False
+
+
+# Module-level Playwright instance to avoid asyncio conflicts
+_pw_singleton = None
+
+def _connect_persistent_browser(require_linkedin: bool = False):
+    """Try to connect to the persistent browser via CDP.
+    Returns (browser, page, is_persistent, pw) or (None, None, False, None).
+    Uses a module-level Playwright singleton to avoid 'Sync API inside asyncio loop' errors.
+    """
+    global _pw_singleton
     import urllib.request
     try:
         req = urllib.request.Request("http://127.0.0.1:9222/json/version")
         urllib.request.urlopen(req, timeout=3)
     except:
-        return None, None, False
+        return None, None, False, None
     
-    try:
-        from playwright.sync_api import sync_playwright
-        pw = sync_playwright().start()
-        browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        
-        # Verify LinkedIn is logged in
-        cookies = ctx.cookies()
-        has_li_at = any(c["name"] == "li_at" for c in cookies if "linkedin" in c.get("domain", ""))
-        if has_li_at:
-            print(f"  [AutoApply] ✅ Using persistent browser (LinkedIn logged in)")
-            return browser, page, True
-        else:
-            print(f"  [AutoApply] Persistent browser running but LinkedIn not logged in")
-            browser.close()
-            pw.stop()
-            return None, None, False
-    except Exception as e:
-        print(f"  [AutoApply] Persistent browser connect error: {e}")
-        return None, None, False
+    # Try to use the existing singleton, but if it's corrupted, reset it
+    pw = None
+    if _pw_singleton is not None:
+        try:
+            # Test if the singleton is still alive
+            _ = _pw_singleton.chromium.executable_path
+            pw = _pw_singleton
+        except Exception:
+            # Singleton is corrupted — reset it
+            print(f"  [AutoApply] Playwright singleton corrupted, resetting...")
+            try: _pw_singleton.stop()
+            except: pass
+            _pw_singleton = None
+    
+    if pw is None:
+        try:
+            from playwright.sync_api import sync_playwright
+            _pw_singleton = sync_playwright().start()
+            pw = _pw_singleton
+        except Exception as e:
+            print(f"  [AutoApply] Failed to start Playwright: {e}")
+            return None, None, False, None
+    
+    # Try to connect — if it fails with "Event loop is closed", reset singleton and retry
+    for attempt in range(2):
+        try:
+            browser = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            
+            # Fix LinkedIn cookies — copy li_at to .linkedin.com for all subdomains
+            if require_linkedin:
+                _fix_linkedin_cookies(ctx)
+            
+            if require_linkedin:
+                # Verify LinkedIn is logged in
+                cookies = ctx.cookies()
+                has_li_at = any(c["name"] == "li_at" for c in cookies if "linkedin" in c.get("domain", ""))
+                if has_li_at:
+                    print(f"  [AutoApply] ✅ Using persistent browser (LinkedIn logged in)")
+                    return browser, page, True, pw
+                else:
+                    print(f"  [AutoApply] Persistent browser running but LinkedIn not logged in")
+                    try: browser.close()
+                    except: pass
+                    return None, None, False, None
+            else:
+                print(f"  [AutoApply] ✅ Using persistent browser")
+                return browser, page, True, pw
+        except Exception as e:
+            err_str = str(e)
+            if ("Event loop is closed" in err_str or "already stopped" in err_str) and attempt == 0:
+                print(f"  [AutoApply] Playwright event loop closed, resetting singleton and retrying...")
+                try: _pw_singleton.stop()
+                except: pass
+                _pw_singleton = None
+                try:
+                    from playwright.sync_api import sync_playwright
+                    _pw_singleton = sync_playwright().start()
+                    pw = _pw_singleton
+                    continue
+                except Exception as e2:
+                    print(f"  [AutoApply] Failed to restart Playwright: {e2}")
+                    return None, None, False, None
+            print(f"  [AutoApply] Persistent browser connect error: {e}")
+            try:
+                if _pw_singleton:
+                    _pw_singleton.stop()
+            except:
+                pass
+            _pw_singleton = None
+            return None, None, False, None
+    
+    return None, None, False, None
 
 
 def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover_text: str) -> dict:
@@ -800,7 +902,9 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
     is_persistent = False
 
     # Strategy 1: Try persistent browser (LinkedIn already logged in)
-    browser, page, is_persistent = _connect_persistent_browser()
+    # Check if this is a LinkedIn job (needs LinkedIn login) or other site
+    is_linkedin_job = "linkedin.com" in (url or "").lower()
+    browser, page, is_persistent, _cdp_pw = _connect_persistent_browser(require_linkedin=is_linkedin_job)
     
     if browser and page:
         _pw_instance = None  # CDP connection manages its own playwright
@@ -847,7 +951,8 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
         import tempfile
 
         chromium_bin = os.environ.get("CHROMIUM_BIN", "")
-        if not chromium_bin:
+        # Try to get path from Playwright
+        if not chromium_bin or not os.path.exists(chromium_bin):
             try:
                 from playwright.sync_api import sync_playwright as _sp
                 _pw = _sp().start()
@@ -855,8 +960,17 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
                 _pw.stop()
             except Exception:
                 pass
+        # Fallback to Playwright cache
         if not chromium_bin or not os.path.exists(chromium_bin):
-            chromium_bin = "chromium"
+            import glob as _glob
+            _cache_paths = _glob.glob("/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome")
+            if _cache_paths:
+                chromium_bin = _cache_paths[0]
+        # Last resort
+        if not chromium_bin or not os.path.exists(chromium_bin):
+            chromium_bin = "/usr/bin/chromium"
+        
+        print(f"  [AutoApply] Chromium path: {chromium_bin}")
 
         _debug_port = 9555
         _chromium_proc = None
@@ -981,38 +1095,103 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
                 print(f"  [AutoApply] Cookie injection error: {e}")
 
     try:
-        # For LinkedIn: force English locale and check session
+        # For LinkedIn: use dedicated Easy Apply flow
         if ats_type == "linkedin" or "linkedin" in url.lower():
             current_url = page.url
             if "login" in current_url.lower() or "authwall" in current_url.lower():
-                print(f"  [AutoApply] Login redirect — session may have expired")
+                # Try to login first
+                print(f"  [AutoApply] Login redirect — attempting login...")
+                login_result = _handle_site_login(page, profile, creds, ats_type, url)
+                if not login_result.get("success"):
+                    if not is_persistent:
+                        try: browser.close()
+                        except: pass
+                        if _pw_instance: _pw_instance.stop()
+                        if _cdp_pw:
+                            try: _cdp_pw.stop()
+                            except: pass
+                    return {
+                        "success": False,
+                        "method": "login_failed",
+                        "result": f"LinkedIn login failed: {login_result.get('result', 'unknown')}. Re-login via /login-browser"
+                    }
+                # Navigate back to job page after login
+                try:
+                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(5000)
+                except:
+                    pass
             else:
-                print(f"  [AutoApply] Session active (page loaded)")
-
-            # Click Apply button
-            print(f"  [AutoApply] Looking for Apply button...")
-            apply_clicked = _click_apply_button(page, ats_type)
-            if apply_clicked:
-                print(f"  [AutoApply] Clicked Apply button")
-                page.wait_for_timeout(3000)
+                print(f"  [AutoApply] LinkedIn session active")
+            
+            # Use the dedicated LinkedIn Easy Apply handler
+            ea_result = _linkedin_easy_apply(page, profile, job, cv_text, cover_text)
+            
+            # Screenshot proof
+            screenshot_dir = BASE_DIR / "data" / "proofs"
+            screenshot_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                page.screenshot(path=str(screenshot_dir / f"apply_{job.get('id', 'unknown')}.png"), full_page=False, timeout=10000)
+            except:
+                pass
+            
+            # Cleanup
+            if is_persistent:
+                try: browser.close()
+                except: pass
+                if _cdp_pw:
+                    try: _cdp_pw.stop()
+                    except: pass
             else:
-                print(f"  [AutoApply] No Apply button found")
-
-        # Check if login is needed
+                try: browser.close()
+                except: pass
+                if _pw_instance:
+                    _pw_instance.stop()
+            
+            if ea_result.get("success"):
+                return {
+                    "success": True,
+                    "method": "linkedin_easy_apply",
+                    "result": ea_result.get("result", "Easy Apply submitted")
+                }
+            else:
+                return {
+                    "success": False,
+                    "method": "linkedin_easy_apply",
+                    "result": ea_result.get("result", "Easy Apply failed")
+                }
+        
+        # --- Non-LinkedIn sites below ---
+        
+        # Check if login is needed for non-LinkedIn sites
         if _needs_login(page):
             print(f"  [AutoApply] Login required, attempting...")
             login_result = _handle_site_login(page, profile, creds, ats_type, url)
 
             if not login_result.get("success"):
-                if HAS_CAPTCHA_SOLVER:
-                    captcha_solved = _solve_captcha_if_needed(page, url)
-                    if captcha_solved and "checkpoint" not in page.url.lower():
-                        print(f"  [AutoApply] Captcha solved!")
-                        try:
-                            page.goto(url, timeout=20000, wait_until="domcontentloaded")
-                            page.wait_for_timeout(3000)
-                        except Exception:
-                            pass
+                # Try signup if login failed
+                print(f"  [AutoApply] Login failed, trying signup...")
+                signup_result = _handle_signup(page, profile, creds)
+                if not signup_result.get("success"):
+                    if HAS_CAPTCHA_SOLVER:
+                        captcha_solved = _solve_captcha_if_needed(page, url)
+                        if captcha_solved and "checkpoint" not in page.url.lower():
+                            print(f"  [AutoApply] Captcha solved!")
+                            try:
+                                page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                                page.wait_for_timeout(3000)
+                            except Exception:
+                                pass
+                        else:
+                            if not is_persistent:
+                                try: browser.close()
+                                except: pass
+                                if _pw_instance: _pw_instance.stop()
+                            return {
+                                "success": False,
+                                "method": "login_failed",
+                                "result": f"Login/signup failed: {login_result.get('result', 'unknown')}. Set 2Captcha API key."
+                            }
                     else:
                         if not is_persistent:
                             try: browser.close()
@@ -1021,18 +1200,16 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
                         return {
                             "success": False,
                             "method": "login_failed",
-                            "result": f"Login failed: {login_result.get('result', 'unknown')}. Set 2Captcha API key."
+                            "result": f"Login/signup failed: {login_result.get('result', 'unknown')}"
                         }
                 else:
-                    if not is_persistent:
-                        try: browser.close()
-                        except: pass
-                        if _pw_instance: _pw_instance.stop()
-                    return {
-                        "success": False,
-                        "method": "login_failed",
-                        "result": f"Login failed: {login_result.get('result', 'unknown')}"
-                    }
+                    print(f"  [AutoApply] Signup successful!")
+                    # Navigate back to job page after signup
+                    try:
+                        page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                        page.wait_for_timeout(3000)
+                    except:
+                        pass
             else:
                 print(f"  [AutoApply] Login successful!")
                 page.wait_for_timeout(2000)
@@ -1041,8 +1218,18 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
                 try:
                     page.goto(url, timeout=20000, wait_until="domcontentloaded")
                     page.wait_for_timeout(3000)
-                except Exception:
+                except:
                     pass
+
+        # For non-LinkedIn: click Apply button if present
+        if ats_type != "linkedin":
+            print(f"  [AutoApply] Looking for Apply button...")
+            apply_clicked = _click_apply_button(page, ats_type)
+            if apply_clicked:
+                print(f"  [AutoApply] Clicked Apply button")
+                page.wait_for_timeout(3000)
+            else:
+                print(f"  [AutoApply] No Apply button found")
 
         if HAS_CAPTCHA_SOLVER:
             _solve_captcha_if_needed(page, url)
@@ -1058,12 +1245,18 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
         except Exception:
             pass
 
-        # Cleanup (only for non-persistent browser)
-        if not is_persistent:
+        # Cleanup — disconnect from CDP (don't close persistent browser or stop singleton pw)
+        if is_persistent:
+            # Just disconnect the CDP browser object — don't close the actual browser process
+            # and don't stop the singleton Playwright instance (it will be reused)
+            try: browser.close()
+            except: pass
+        else:
             try: browser.close()
             except: pass
             if _pw_instance:
-                _pw_instance.stop()
+                try: _pw_instance.stop()
+                except: pass
 
         if form_result.get("success"):
             return {
@@ -1083,7 +1276,11 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
             try: browser.close()
             except: pass
             if _pw_instance:
-                _pw_instance.stop()
+                try: _pw_instance.stop()
+                except: pass
+        else:
+            try: browser.close()
+            except: pass
         return {"success": False, "method": "web_error", "result": str(e)}
     finally:
         # Clean up temp profile and chromium proc (non-persistent only)
@@ -1105,6 +1302,584 @@ def _automated_web_apply(url: str, profile: dict, job: dict, cv_text: str, cover
                     import shutil
                     shutil.rmtree(_temp_profile, ignore_errors=True)
                 except: pass
+
+
+def _linkedin_easy_apply(page, profile: dict, job: dict, cv_text: str, cover_text: str) -> dict:
+    """
+    Handle LinkedIn Easy Apply flow:
+    1. Fix LinkedIn cookies (copy li_at to .linkedin.com for all subdomains)
+    2. Navigate to job page via www.linkedin.com (where session works)
+    3. Find and click "Easy Apply" or "Apply" button
+    4. Handle multi-step modal form: contact info → resume → questions → review
+    5. Fill fields, upload CV, click Next/Submit on each step
+    6. Submit application
+    """
+    import time as _time
+    import os as _os
+    
+    # Fix cookies — copy li_at from .www.linkedin.com to .linkedin.com
+    try:
+        ctx = page.context
+        _fix_linkedin_cookies(ctx)
+    except:
+        pass
+    
+    # Rewrite the URL to use www.linkedin.com (where our session cookies work)
+    # Extract job ID from URL and build clean www.linkedin.com URL
+    # This avoids the "Sign in" modal on regional subdomains (de, uk, in, etc.)
+    job_url = page.url
+    import re as _re
+    # Extract job ID (6+ digit number) from the URL
+    id_match = _re.search(r'(\d{6,})', job_url)
+    if id_match:
+        job_id = id_match.group(1)
+        fixed_url = f"https://www.linkedin.com/jobs/view/{job_id}/"
+        if fixed_url != job_url:
+            print(f"  [LinkedIn EA] Rewriting URL: {job_url[:60]} → {fixed_url}")
+            try:
+                page.goto(fixed_url, timeout=25000, wait_until="domcontentloaded")
+                _time.sleep(8)
+            except:
+                pass
+    else:
+        # Fallback: just replace the domain
+        fixed_url = _re.sub(r'https?://[a-z]{2}\.linkedin\.com', 'https://www.linkedin.com', job_url)
+        if fixed_url != job_url:
+            print(f"  [LinkedIn EA] Rewriting URL (domain only): {job_url[:60]} → {fixed_url[:60]}")
+            try:
+                page.goto(fixed_url, timeout=25000, wait_until="domcontentloaded")
+                _time.sleep(8)
+            except:
+                pass
+    
+    email = profile.get("email", "")
+    name = profile.get("name", "")
+    phone = profile.get("phone", "")
+    name_parts = name.split()
+    first_name = name_parts[0] if name_parts else ""
+    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+    location = profile.get("location", "")
+    linkedin_url = profile.get("linkedin", "")
+    
+    # Step 1: Check we're on a LinkedIn job page
+    current_url = page.url
+    if "login" in current_url.lower() or "authwall" in current_url.lower():
+        return {"success": False, "result": "LinkedIn session expired — need to re-login via /login-browser"}
+    
+    # Step 2: Dismiss any modal overlays (LinkedIn often shows "Sign in" popups)
+    try:
+        dismiss_selectors = [
+            "button[aria-label='Dismiss']",
+            "button[aria-label='Close']",
+            "button.artdeco-modal__dismiss",
+            "button:has-text('Dismiss')",
+            "button:has-text('Not now')",
+            "button:has-text('Skip')",
+        ]
+        for sel in dismiss_selectors:
+            try:
+                loc = page.locator(sel)
+                for i in range(loc.count()):
+                    if loc.nth(i).is_visible():
+                        loc.nth(i).click(timeout=3000)
+                        print(f"  [LinkedIn EA] Dismissed modal: {sel}")
+                        import time as _t
+                        _t.sleep(2)
+                        break
+            except:
+                continue
+        # Also press Escape to close any remaining overlays
+        page.keyboard.press("Escape")
+        import time as _t
+        _t.sleep(1)
+    except:
+        pass
+    
+    # Step 2b: Check if this is an external redirect job (not Easy Apply)
+    # LinkedIn shows "Responses managed off LinkedIn" for external jobs
+    try:
+        body_text = page.inner_text("body")[:2000]
+        external_indicators = [
+            "Responses managed off LinkedIn",
+            "managed off LinkedIn",
+            "off LinkedIn",
+        ]
+        is_external = any(ind in body_text for ind in external_indicators)
+        
+        if is_external:
+            print(f"  [LinkedIn EA] External job detected (Responses managed off LinkedIn) — skipping")
+            return {"success": False, "result": "External redirect job (not Easy Apply) — skipped. Only LinkedIn Easy Apply jobs are applied to."}
+        
+        # Also check if the Apply button has an external link icon
+        # LinkedIn external apply buttons have class containing "external" or the apply URL goes off-site
+        apply_btn = page.locator("button:has-text('Apply'), a:has-text('Apply')")
+        for i in range(apply_btn.count()):
+            try:
+                if apply_btn.nth(i).is_visible():
+                    # Check if there's an external link icon (svg with "external-link" or "launch" in the class)
+                    btn_html = apply_btn.nth(i).evaluate("e => e.outerHTML")
+                    if "external" in btn_html.lower() or "launch" in btn_html.lower() or "offsite" in btn_html.lower():
+                        print(f"  [LinkedIn EA] External apply button detected — skipping")
+                        return {"success": False, "result": "External redirect job (external apply button) — skipped"}
+            except:
+                continue
+    except:
+        pass
+    
+    # Step 3: Find Easy Apply button OR regular Apply button (both can trigger Easy Apply modal)
+    print(f"  [LinkedIn EA] Looking for Apply button...")
+    # On LinkedIn, both "Easy Apply" and "Apply" buttons can open the Easy Apply modal
+    # The key is whether it opens a modal (LinkedIn) or redirects (external)
+    apply_selectors = [
+        "button:has-text('Easy Apply')",
+        "button:has-text('Einfach bewerben')",  # German
+        "button:has-text('Apply')",
+        "button:has-text('Apply now')",
+        "button:has-text('Apply Now')",
+        "button:has-text('Bewerben')",  # German
+        "button.jobs-apply-button--top-card",
+        "div.jobs-apply-button--top-card",
+        ".apply-button",
+        "button[class*='apply']",
+        "a[class*='apply']",
+    ]
+    
+    ea_clicked = False
+    url_before_click = page.url
+    
+    # Retry finding the button — page may need more time to render
+    for retry in range(3):
+        for sel in apply_selectors:
+            try:
+                loc = page.locator(sel)
+                for i in range(loc.count()):
+                    try:
+                        if loc.nth(i).is_visible():
+                            # Click with force=True to bypass any overlay
+                            loc.nth(i).click(timeout=8000, force=True)
+                            print(f"  [LinkedIn EA] Clicked Apply button: {sel}")
+                            ea_clicked = True
+                            break
+                    except:
+                        continue
+                if ea_clicked:
+                    break
+            except:
+                continue
+        if ea_clicked:
+            break
+        if retry < 2:
+            print(f"  [LinkedIn EA] Button not found yet, waiting... (retry {retry+1}/3)")
+            _time.sleep(5)
+    
+    if not ea_clicked:
+        # Take a screenshot for debugging
+        try:
+            page.screenshot(path="/opt/job-agent/data/proofs/no_apply_btn.png", timeout=10000)
+        except:
+            pass
+        return {"success": False, "result": "No Apply button found on page (after 3 retries)"}
+    
+    # Wait for modal to open or page to redirect
+    import time as _t
+    _t.sleep(5)
+    
+    # Check if we redirected to an external site (non-LinkedIn)
+    url_after_click = page.url
+    if "linkedin.com" not in url_after_click:
+        return {"success": False, "result": f"Apply redirected to external site: {url_after_click[:60]}. Only Easy Apply (LinkedIn internal) jobs are applied to."}
+    
+    # If we redirected to a /apply/ URL on LinkedIn, that's the new Easy Apply flow
+    if "/apply" in url_after_click:
+        print(f"  [LinkedIn EA] Redirected to LinkedIn apply page: {url_after_click[:80]}")
+        _t.sleep(5)  # Wait for the apply page to load
+        # The apply page IS the modal — use page directly
+        modal = page
+    else:
+        # Check for modal dialog on the same page
+        modal = None
+        for sel in ["div[role='dialog']", ".jobs-easy-apply-modal", "div.artdeco-modal"]:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible():
+                    modal = loc.first
+                    print(f"  [LinkedIn EA] Modal opened (selector: {sel})")
+                    break
+            except:
+                continue
+        
+        if not modal:
+            # Maybe the page changed — check if we're still on the job page
+            if url_after_click != url_before_click:
+                print(f"  [LinkedIn EA] Page navigated to: {url_after_click[:80]}")
+                # Wait more and check again
+                _t.sleep(3)
+                for sel in ["div[role='dialog']", ".jobs-easy-apply-modal"]:
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            modal = loc.first
+                            print(f"  [LinkedIn EA] Modal found after wait")
+                            break
+                    except:
+                        continue
+            
+            if not modal:
+                # Use page as modal (some LinkedIn flows replace the whole page)
+                print(f"  [LinkedIn EA] No modal dialog — using page as form context")
+                modal = page
+    
+    # Step 4: Get the CV file path
+    cv_file_path = None
+    try:
+        from cv_manager import get_primary_cv
+        primary_cv = get_primary_cv()
+        if primary_cv and primary_cv.get("file_path"):
+            cv_file_path = primary_cv["file_path"]
+            print(f"  [LinkedIn EA] CV file: {primary_cv['original_filename']}")
+    except Exception:
+        pass
+    
+    # Step 5: Walk through the multi-step form
+    max_steps = 10
+    fields_filled = 0
+    cv_uploaded = False
+    been_to_review = False
+    
+
+    
+    for step in range(max_steps):
+        print(f"  [LinkedIn EA] Step {step + 1}...")
+        _time.sleep(2)
+        
+        # 5a: Fill visible input fields
+        try:
+            # Common LinkedIn Easy Apply form fields
+            field_map = [
+                # (selectors, value)
+                (["input[name='name']", "input[aria-label*='Full name']", "input[placeholder*='Full name']"], name),
+                (["input[name='firstName']", "input[aria-label*='First name']", "input[placeholder*='First name']"], first_name),
+                (["input[name='lastName']", "input[aria-label*='Last name']", "input[placeholder*='Last name']"], last_name),
+                (["input[type='email']", "input[name='email']", "input[aria-label*='email']", "input[placeholder*='email']"], email),
+                (["input[type='tel']", "input[name='phone']", "input[aria-label*='phone']", "input[placeholder*='phone']"], phone),
+                (["input[name='location']", "input[aria-label*='location']", "input[placeholder*='city']",
+                  "input[placeholder*='Location']", "input[placeholder*='City']"], location),
+                (["input[name='linkedin']", "input[aria-label*='LinkedIn']", "input[placeholder*='LinkedIn']"], linkedin_url),
+            ]
+            
+            for selectors, value in field_map:
+                if not value:
+                    continue
+                for sel in selectors:
+                    try:
+                        inp = modal.locator(sel) if modal != page else page.locator(sel)
+                        for j in range(inp.count()):
+                            try:
+                                if inp.nth(j).is_visible():
+                                    current = inp.nth(j).input_value()
+                                    if not current:
+                                        inp.nth(j).fill(value, timeout=5000)
+                                        fields_filled += 1
+                                        print(f"  [LinkedIn EA] Filled {sel}: {value[:30]}")
+                                        break
+                            except:
+                                continue
+                    except:
+                        continue
+        except Exception as e:
+            print(f"  [LinkedIn EA] Field fill error: {e}")
+        
+        # 5b: Upload CV if we see a file upload area
+        if not cv_uploaded and cv_file_path:
+            try:
+                # LinkedIn Easy Apply file upload — the input is HIDDEN, we need to find it
+                file_inputs = page.locator("input[type='file']") if modal == page else modal.locator("input[type='file']")
+                for j in range(file_inputs.count()):
+                    try:
+                        fi = file_inputs.nth(j)
+                        # Don't check is_visible — LinkedIn hides file inputs
+                        fi.set_input_files(cv_file_path, timeout=10000)
+                        cv_uploaded = True
+                        fields_filled += 1
+                        print(f"  [LinkedIn EA] Uploaded CV file")
+                        _time.sleep(3)  # Wait for upload
+                        break
+                    except:
+                        continue
+                
+                # Also try clicking "Upload resume" button then use file input
+                if not cv_uploaded:
+                    upload_btns = page.locator("button:has-text('Upload'), label:has-text('Upload'), button:has-text('resume'), button:has-text('CV')")
+                    for j in range(upload_btns.count()):
+                        try:
+                            if upload_btns.nth(j).is_visible():
+                                upload_btns.nth(j).click(timeout=5000)
+                                _time.sleep(2)
+                                # Now try file input
+                                file_inputs = page.locator("input[type='file']")
+                                for k in range(file_inputs.count()):
+                                    try:
+                                        file_inputs.nth(k).set_input_files(cv_file_path, timeout=10000)
+                                        cv_uploaded = True
+                                        fields_filled += 1
+                                        print(f"  [LinkedIn EA] Uploaded CV file (via upload button)")
+                                        _time.sleep(3)
+                                        break
+                                    except:
+                                        continue
+                                if cv_uploaded:
+                                    break
+                        except:
+                            continue
+            except Exception as e:
+                print(f"  [LinkedIn EA] CV upload error: {e}")
+        
+        # 5c: Handle dropdowns (experience years, etc.)
+        try:
+            selects = page.locator("select") if modal == page else modal.locator("select")
+            for j in range(selects.count()):
+                try:
+                    sel_elem = selects.nth(j)
+                    if not sel_elem.is_visible():
+                        continue
+                    select_name = (sel_elem.get_attribute("name") or "").lower()
+                    aria_label = (sel_elem.get_attribute("aria-label") or "").lower()
+                    
+                    # Try to select reasonable defaults
+                    options = sel_elem.locator("option")
+                    opt_texts = []
+                    for k in range(options.count()):
+                        try:
+                            opt_texts.append(options.nth(k).inner_text().strip())
+                        except:
+                            pass
+                    
+                    if any(k in select_name + aria_label for k in ["experience", "years"]):
+                        for target in ["5+", "3-5", "3+", "2-4", "1-3", "5-7"]:
+                            for k, ot in enumerate(opt_texts):
+                                if target in ot:
+                                    sel_elem.select_option(index=k)
+                                    fields_filled += 1
+                                    print(f"  [LinkedIn EA] Selected experience: {ot}")
+                                    break
+                            else:
+                                continue
+                            break
+                    elif any(k in select_name + aria_label for k in ["country", "location", "region"]):
+                        for target in ["Pakistan", "Asia"]:
+                            for k, ot in enumerate(opt_texts):
+                                if target.lower() in ot.lower():
+                                    sel_elem.select_option(index=k)
+                                    fields_filled += 1
+                                    print(f"  [LinkedIn EA] Selected country: {ot}")
+                                    break
+                            else:
+                                continue
+                            break
+                except:
+                    continue
+        except:
+            pass
+        
+        # 5d: Handle checkboxes (consent, terms)
+        try:
+            checkboxes = page.locator("input[type='checkbox']") if modal == page else modal.locator("input[type='checkbox']")
+            for j in range(checkboxes.count()):
+                try:
+                    cb = checkboxes.nth(j)
+                    if cb.is_visible() and not cb.is_checked():
+                        cb.check(timeout=3000)
+                        fields_filled += 1
+                        print(f"  [LinkedIn EA] Checked a checkbox")
+                except:
+                    continue
+        except:
+            pass
+        
+        # 5e: Handle textareas (cover letter, additional info)
+        try:
+            textareas = page.locator("textarea") if modal == page else modal.locator("textarea")
+            for j in range(textareas.count()):
+                try:
+                    ta = textareas.nth(j)
+                    if ta.is_visible():
+                        current = ta.input_value()
+                        if not current:
+                            # Determine what this textarea is for
+                            ta_name = (ta.get_attribute("name") or "").lower()
+                            ta_label = (ta.get_attribute("aria-label") or "").lower()
+                            ta_ph = (ta.get_attribute("placeholder") or "").lower()
+                            ta_context = ta_name + " " + ta_label + " " + ta_ph
+                            
+                            if any(k in ta_context for k in ["cover", "letter", "message", "why", "additional"]):
+                                ta.fill(cover_text[:3000], timeout=5000)
+                                fields_filled += 1
+                                print(f"  [LinkedIn EA] Filled cover letter textarea")
+                            elif any(k in ta_context for k in ["experience", "summary", "about"]):
+                                ta.fill(cv_text[:3000], timeout=5000)
+                                fields_filled += 1
+                                print(f"  [LinkedIn EA] Filled experience textarea")
+                except:
+                    continue
+        except:
+            pass
+        
+        # 5f: Click "Next" or "Submit" or "Review" button
+        # Priority: Submit application > Next > Review (only once)
+        # On review page, only click "Submit application"
+        if been_to_review:
+            next_selectors = [
+                "button:has-text('Submit application')",
+                "button:has-text('Submit')",
+                "button:has-text('Bewerbung abschicken')",  # German
+            ]
+        else:
+            next_selectors = [
+                "button:has-text('Submit application')",
+                "button:has-text('Next')",
+                "button:has-text('Weiter')",  # German
+                "button:has-text('Review')",
+                "button:has-text('Überprüfen')",  # German
+                "button[aria-label='Continue to next step']",
+            ]
+        
+        clicked_next = False
+        for sel in next_selectors:
+            try:
+                # Search in modal or page
+                btns = page.locator(sel) if modal == page else modal.locator(sel)
+                # Also check page-wide if modal is a dialog
+                if modal != page:
+                    btns = page.locator(sel)
+                for j in range(btns.count()):
+                    try:
+                        btn = btns.nth(j)
+                        if btn.is_visible():
+                            btn_text = btn.inner_text().strip().lower()
+                            btn.click(timeout=8000)
+                            clicked_next = True
+                            print(f"  [LinkedIn EA] Clicked: {btn_text[:30]}")
+                            if "review" in btn_text:
+                                been_to_review = True
+                            _time.sleep(3)
+                            break
+                    except:
+                        continue
+                if clicked_next:
+                    break
+            except:
+                continue
+        
+        if not clicked_next:
+            # Check if we're on a "Review" or final page
+            try:
+                body_text = page.inner_text("body")[:500].lower()
+                if "review" in body_text or "submit" in body_text:
+                    # Try submit button one more time
+                    for sel in ["button:has-text('Submit application')", "button:has-text('Submit')", "button:has-text('Bewerbung abschicken')"]:
+                        try:
+                            btn = page.locator(sel)
+                            for j in range(btn.count()):
+                                if btn.nth(j).is_visible():
+                                    btn.nth(j).click(timeout=8000)
+                                    clicked_next = True
+                                    print(f"  [LinkedIn EA] Final submit clicked")
+                                    _time.sleep(5)
+                                    break
+                            if clicked_next:
+                                break
+                        except:
+                            continue
+            except:
+                pass
+            
+            if not clicked_next:
+                if been_to_review:
+                    print(f"  [LinkedIn EA] On review page but no Submit button — form may require manual questions")
+                    # Try one last time with broader selectors
+                    for sel in ["button:has-text('Submit')", "button[type='submit']", "button.artdeco-button--primary"]:
+                        try:
+                            btn = page.locator(sel)
+                            for j in range(btn.count()):
+                                if btn.nth(j).is_visible():
+                                    txt = btn.nth(j).inner_text().strip().lower()
+                                    if "submit" in txt or "send" in txt or "abschicken" in txt:
+                                        btn.nth(j).click(timeout=8000, force=True)
+                                        print(f"  [LinkedIn EA] Final submit clicked: {txt[:30]}")
+                                        _time.sleep(5)
+                                        clicked_next = True
+                                        break
+                            if clicked_next:
+                                break
+                        except:
+                            continue
+                if not clicked_next:
+                    print(f"  [LinkedIn EA] No Next/Submit button found — may be done or stuck")
+                    # Check if application was submitted (success message)
+                    try:
+                        body = page.inner_text("body")[:500].lower()
+                        if "your application has been sent" in body or "application was sent" in body or "applied" in body:
+                            print(f"  [LinkedIn EA] Application submitted successfully!")
+                            return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields filled, CV uploaded: {cv_uploaded})"}
+                    except:
+                        pass
+                    break
+        
+        # Check if application was submitted after clicking
+        try:
+            body = page.inner_text("body")[:2000].lower()
+            success_phrases = [
+                "application has been sent", "application was sent", "you applied",
+                "application submitted", "submitted now", "we sent your application",
+            ]
+            if any(s in body for s in success_phrases):
+                print(f"  [LinkedIn EA] ✅ Application submitted successfully!")
+                return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields, CV: {cv_uploaded})"}
+            # Check for "Apply" button changed to "Applied" (LinkedIn shows this)
+            applied_btn = page.locator("button:has-text('Applied')")
+            if applied_btn.count() > 0 and applied_btn.first.is_visible():
+                print(f"  [LinkedIn EA] ✅ Button = 'Applied' — success!")
+                return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields, CV: {cv_uploaded})"}
+            # Check for "View resume" link
+            view_resume = page.locator("a:has-text('View resume')")
+            if view_resume.count() > 0 and view_resume.first.is_visible():
+                print(f"  [LinkedIn EA] ✅ 'View resume' — success!")
+                return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields, CV: {cv_uploaded})"}
+        except:
+            pass
+    
+    # Final check — did we see a success indicator?
+    try:
+        body = page.inner_text("body")[:2000].lower()
+        # LinkedIn shows various success indicators after submission
+        success_phrases = [
+            "application has been sent",
+            "application was sent", 
+            "you applied",
+            "application submitted",
+            "application status",
+            "submitted now",
+            "we sent your application",
+        ]
+        if any(s in body for s in success_phrases):
+            print(f"  [LinkedIn EA] ✅ Success detected — application submitted!")
+            return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields, CV: {cv_uploaded})"}
+        
+        # Check if the Apply button changed to "Applied"
+        applied_btn = page.locator("button:has-text('Applied')")
+        if applied_btn.count() > 0 and applied_btn.first.is_visible():
+            print(f"  [LinkedIn EA] ✅ Button = 'Applied' — success!")
+            return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields, CV: {cv_uploaded})"}
+        
+        # Check for "View resume" link (shown after successful submission)
+        view_resume = page.locator("a:has-text('View resume'), a:has-text('view resume')")
+        if view_resume.count() > 0 and view_resume.first.is_visible():
+            print(f"  [LinkedIn EA] ✅ 'View resume' link found — success!")
+            return {"success": True, "result": f"Easy Apply submitted ({fields_filled} fields, CV: {cv_uploaded})"}
+    except:
+        pass
+    
+    return {"success": False, "result": f"Easy Apply flow ended without confirmation ({fields_filled} fields filled, CV: {cv_uploaded})"}
 
 
 def _detect_ats(url: str) -> str:
@@ -1817,23 +2592,49 @@ def _fill_application_form(page, profile: dict, job: dict, cv_text: str, cover_t
             except Exception:
                 continue
 
-        # Handle file upload for CV (if we have a primary CV file)
+        # Handle file upload for CV — file inputs are often HIDDEN, don't check is_visible
         try:
             from cv_manager import get_primary_cv
             primary_cv = get_primary_cv()
             if primary_cv and primary_cv.get("file_path"):
                 file_inputs = page.query_selector_all("input[type='file']")
+                uploaded = False
                 for fi in file_inputs:
                     try:
-                        if fi.is_visible():
-                            fi.set_input_files(primary_cv["file_path"])
-                            filled += 1
-                            print(f"  [AutoApply] Uploaded CV file: {primary_cv['original_filename']}")
-                            break
+                        # Don't check is_visible — many ATS hide file inputs
+                        fi.set_input_files(primary_cv["file_path"])
+                        filled += 1
+                        uploaded = True
+                        print(f"  [AutoApply] Uploaded CV file: {primary_cv['original_filename']}")
+                        break
                     except Exception:
                         continue
-        except Exception:
-            pass
+                # If no file input found, try clicking upload button then setting files
+                if not uploaded:
+                    upload_btns = page.query_selector_all("button, a, label")
+                    for btn in upload_btns:
+                        try:
+                            text = btn.inner_text().lower()
+                            if btn.is_visible() and any(k in text for k in ["upload", "resume", "cv", "attach"]):
+                                btn.click()
+                                page.wait_for_timeout(2000)
+                                # Try file input again
+                                file_inputs = page.query_selector_all("input[type='file']")
+                                for fi in file_inputs:
+                                    try:
+                                        fi.set_input_files(primary_cv["file_path"])
+                                        filled += 1
+                                        uploaded = True
+                                        print(f"  [AutoApply] Uploaded CV file (via upload button): {primary_cv['original_filename']}")
+                                        break
+                                    except:
+                                        continue
+                                if uploaded:
+                                    break
+                        except:
+                            continue
+        except Exception as e:
+            print(f"  [AutoApply] CV upload error: {e}")
 
         # Handle dropdown selections (experience, job type, etc.)
         try:
@@ -1971,6 +2772,83 @@ def notify(event: str, details: str, level: str = "info"):
 
 # --- The Autonomous Agent Loop ---
 
+def backfill_apply_eligible_jobs(max_jobs: int = 20, source_filter: str = None):
+    """Apply to previously-evaluated jobs that now meet the auto-apply threshold.
+    This handles jobs that were evaluated when the threshold was higher.
+    """
+    profile = get_profile()
+    threshold = profile.get("auto_apply_threshold", 50)
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Find evaluated jobs that meet the threshold and haven't been applied to
+    if source_filter:
+        c.execute(
+            "SELECT id, source, title, company, location, url, apply_url, fit_score, description FROM jobs "
+            "WHERE status='evaluated' AND fit_score >= ? AND source=? "
+            "ORDER BY fit_score DESC LIMIT ?",
+            (threshold, source_filter, max_jobs)
+        )
+    else:
+        c.execute(
+            "SELECT id, source, title, company, location, url, apply_url, fit_score, description FROM jobs "
+            "WHERE status='evaluated' AND fit_score >= ? "
+            "ORDER BY fit_score DESC LIMIT ?",
+            (threshold, max_jobs)
+        )
+    
+    jobs = c.fetchall()
+    conn.close()
+    
+    if not jobs:
+        print(f"  [Backfill] No eligible jobs to apply to (threshold={threshold})")
+        return 0
+    
+    print(f"  [Backfill] Found {len(jobs)} eligible jobs (threshold={threshold})")
+    applied = 0
+    
+    for row in jobs:
+        job_id, source, title, company, location, url, apply_url, fit_score, description = row
+        print(f"  [Backfill] Applying to: {title[:40]} @ {company} (score={fit_score})")
+        
+        # Reconstruct evaluation
+        from evaluator import EvaluationResult
+        evaluation = EvaluationResult(
+            overall_score=fit_score,
+            verdict="Backfill Apply",
+            strengths=[],
+            gaps=[],
+            should_auto_apply=True,
+            recommendation=f"Score {fit_score}"
+        )
+        
+        job_dict = {
+            "id": job_id,
+            "source": source,
+            "title": title,
+            "company": company,
+            "location": location or "",
+            "url": url or "",
+            "apply_url": apply_url or url or "",
+            "description": description or "",
+        }
+        
+        result = auto_apply_to_job(job_dict, profile, evaluation)
+        applied += 1
+        
+        if result.get("success"):
+            print(f"  [Backfill] ✅ SUCCESS: {result.get('method')} — {result.get('result','')[:60]}")
+        else:
+            print(f"  [Backfill] ❌ FAILED: {result.get('result','')[:80]}")
+        
+        # Rate limit between applications
+        import time as _t
+        _t.sleep(5)
+    
+    return applied
+
+
 def run_agent_cycle():
     """
     Run one monitoring cycle — check all sources for NEW jobs.
@@ -2011,11 +2889,20 @@ def run_agent_cycle():
 
     if not new_jobs:
         print(f"  [{datetime.now().strftime('%H:%M:%S')}] No new jobs ({len(jobs)} already seen)")
+        
+        # BACKFILL — Apply to previously-evaluated jobs that meet threshold
+        # This runs even when there are no new jobs, to process the backlog
+        max_apps = config.get("max_applications_per_cycle", 5)
+        print(f"  [Backfill] Trying {max_apps} previously-evaluated jobs...")
+        backfill_applied = backfill_apply_eligible_jobs(max_jobs=max_apps, source_filter="linkedin")
+        if backfill_applied > 0:
+            print(f"  [Backfill] Applied to {backfill_applied} jobs from backlog")
+        
         update_agent_state({
             "running": 0,
             "next_run": (datetime.now() + timedelta(minutes=config.get("run_interval_hours", 0.05) * 60)).isoformat()
         })
-        return {"discovered": len(jobs), "new": 0, "applied": 0, "notified": 0}
+        return {"discovered": len(jobs), "new": 0, "applied": backfill_applied, "notified": 0}
 
     print(f"  [{datetime.now().strftime('%H:%M:%S')}] Found {len(new_jobs)} NEW job(s)! Evaluating...")
 
@@ -2056,7 +2943,15 @@ def run_agent_cycle():
             if not evaluation.should_auto_apply:
                 mark_job_status(job.id, "evaluated")
 
-    # 5. UPDATE STATE
+    # 5. BACKFILL — Apply to previously-evaluated jobs that now meet threshold
+    if applied_count < max_applications_per_cycle:
+        remaining_slots = max_applications_per_cycle - applied_count
+        backfill_count = min(remaining_slots, 5)  # Limit backfill per cycle
+        print(f"  [Backfill] Trying {backfill_count} previously-evaluated jobs...")
+        backfill_applied = backfill_apply_eligible_jobs(max_jobs=backfill_count, source_filter="linkedin")
+        applied_count += backfill_applied
+
+    # 6. UPDATE STATE
     summary = (
         f"Scanned: {len(jobs)} | New: {len(new_jobs)} | "
         f"Applied: {applied_count} | Notified: {notified_count}"

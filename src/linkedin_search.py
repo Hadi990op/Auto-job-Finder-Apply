@@ -208,8 +208,11 @@ def search_jobs(
     remote: str = "",
     page: int = 1,
     limit: int = 0,
+    easy_apply_only: bool = True,
 ) -> dict:
-    """Search LinkedIn jobs. Returns dict with 'meta' and 'results'."""
+    """Search LinkedIn jobs. Returns dict with 'meta' and 'results'.
+    easy_apply_only: if True, only return jobs that support Easy Apply (f_AL=true).
+    """
     params = {}
     if query:
         params["keywords"] = query
@@ -221,6 +224,8 @@ def search_jobs(
     wt = _work_type_flag(remote)
     if wt:
         params["f_WT"] = wt
+    if easy_apply_only:
+        params["f_AL"] = "true"
     params["start"] = str((page - 1) * 10)
 
     url = f"{SEARCH_URL}?{urllib.parse.urlencode(params)}"

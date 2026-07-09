@@ -192,7 +192,8 @@ def search_linkedin(query: str, location: str, jobage: int = 14, limit: int = 25
         result = search_jobs(
             location=location, query=query,
             remote="remote" if location.lower() == "remote" else "",
-            jobage=jobage, limit=limit
+            jobage=jobage, limit=limit,
+            easy_apply_only=True,  # Only get Easy Apply jobs
         )
         jobs = []
         for j in result.get("results", []):

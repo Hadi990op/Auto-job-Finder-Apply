@@ -41,6 +41,33 @@ from ai_engine import ai_generate_cv, ai_generate_cover_letter, ai_evaluate_job,
 # Manual login browser (noVNC)
 import manual_login
 
+# Gmail login (noVNC)
+import gmail_login
+
+# Leads agent + outreach
+try:
+    from leads_agent import (
+        init_leads_db, get_all_leads as get_all_leads_db, get_lead as get_lead_by_id,
+        save_lead as save_lead_db, update_lead_status as update_lead_status_db,
+        get_leads_state, update_leads_state, get_leads_config, update_leads_config,
+        get_outreach_messages as get_outreach_msgs, save_outreach_message,
+        update_outreach_message, log_activity as log_leads_activity,
+        run_leads_cycle,
+    )
+    from leads_sources import discover_all_leads, enrich_lead, Lead
+    from proposal_generator import (
+        generate_cold_email, generate_linkedin_dm, generate_twitter_dm,
+        generate_full_proposal, evaluate_lead_fit
+    )
+    from outreach_engine import send_outreach, get_outreach_capability, send_email
+    HAS_LEADS = True
+except ImportError as e:
+    print(f"[App] Leads module not available: {e}")
+    HAS_LEADS = False
+
+if HAS_LEADS:
+    init_leads_db()
+
 # CV upload management
 from cv_manager import (
     save_uploaded_cv, get_uploaded_cvs, get_cv, get_primary_cv,
@@ -75,8 +102,10 @@ app = FastAPI(title="AI Job Agent")
 # --- DB helper ---
 
 def get_db():
-    db = sqlite3.connect(str(DB_PATH))
+    db = sqlite3.connect(str(DB_PATH), timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA busy_timeout = 30000")
     return db
 
 def get_activity_log(limit: int = 50):
@@ -151,12 +180,14 @@ def nav(active: str = "") -> str:
     dot_class = "dot-green" if running else "dot-yellow"
     status_text = "RUNNING" if running else "IDLE"
     return f"""<div class="nav">
-<a href="{BASE}/" class="{'active' if active=='home' else ''}">Dashboard</a>
-<a href="{BASE}/profile" class="{'active' if active=='profile' else ''}">Profile</a>
-<a href="{BASE}/cv" class="{'active' if active=='cv' else ''}">My CVs</a>
+<a href="{BASE}/" class="{'active' if active=='home' else ''}">🏠 Dashboard</a>
+<a href="{BASE}/profile" class="{'active' if active=='profile' else ''}">👤 Profile</a>
+<a href="{BASE}/cv" class="{'active' if active=='cv' else ''}">📄 My CVs</a>
 <a href="{BASE}/credentials" class="{'active' if active=='credentials' else ''}">🔑 Login Accounts</a>
-<a href="{BASE}/jobs" class="{'active' if active=='jobs' else ''}">Jobs</a>
-<a href="{BASE}/applications" class="{'active' if active=='apps' else ''}">Applications</a>
+<a href="{BASE}/jobs" class="{'active' if active=='jobs' else ''}">💼 Jobs</a>
+<a href="{BASE}/applications" class="{'active' if active=='apps' else ''}">📋 Applications</a>
+<a href="{BASE}/leads" class="{'active' if active=='leads' else ''}" style="color:#a78bfa">🎯 Leads</a>
+<a href="{BASE}/outreach" class="{'active' if active=='outreach' else ''}" style="color:#f472b6">✉️ Outreach</a>
 <a href="{BASE}/whatsapp" class="{'active' if active=='whatsapp' else ''}">WhatsApp</a>
 <a href="{BASE}/activity" class="{'active' if active=='activity' else ''}">Activity Log</a>
 <div class="right"><span class="status-dot {dot_class}"></span><span style="font-size:12px;color:#64748b">{status_text}</span></div>
@@ -179,6 +210,24 @@ async def dashboard():
     high_fit = db.execute("SELECT COUNT(*) as c FROM jobs WHERE fit_score >= 60").fetchone()["c"]
     db.close()
 
+    # Leads stats
+    leads_count = 0
+    leads_new = 0
+    leads_contacted = 0
+    leads_high = 0
+    outreach_sent = 0
+    if HAS_LEADS:
+        db = get_db()
+        try:
+            leads_count = db.execute("SELECT COUNT(*) as c FROM leads").fetchone()["c"]
+            leads_new = db.execute("SELECT COUNT(*) as c FROM leads WHERE status='new'").fetchone()["c"]
+            leads_contacted = db.execute("SELECT COUNT(*) as c FROM leads WHERE status='contacted'").fetchone()["c"]
+            leads_high = db.execute("SELECT COUNT(*) as c FROM leads WHERE fit_score >= 60").fetchone()["c"]
+            outreach_sent = db.execute("SELECT COUNT(*) as c FROM outreach_messages WHERE status='sent'").fetchone()["c"]
+        except:
+            pass
+        db.close()
+
     next_run = state.get("next_run", "") if state else ""
     last_run = state.get("last_run", "") if state else ""
     total_applied = state.get("total_applied", 0) if state else 0
@@ -195,17 +244,18 @@ async def dashboard():
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Job Agent</title>
+<title>AI Job & Leads Agent</title>
 <style>{CSS}</style></head><body>
 {nav('home')}
 <div class="container">
-<h1>AI Job Agent</h1>
-<p class="subtitle">Real-time autonomous agent — monitors job sources every 2 minutes, generates AI-powered CV/cover letters, and applies INSTANTLY when a matching job is posted</p>
+<h1>🚀 AI Job & Leads Agent</h1>
+<p class="subtitle">Autonomous agent — discovers jobs AND startup founder leads · generates AI proposals · applies & cold-outreaches automatically</p>
 
-<div style="display:flex;gap:20px;margin-bottom:20px;font-size:13px">
+<div style="display:flex;gap:20px;margin-bottom:20px;font-size:13px;flex-wrap:wrap">
 <span>{ai_badge}</span>
 <span>{wa_badge}</span>
-<span><span style="color:#6ee7b7">●</span> Real-Time Monitor (2 min)</span>
+<span><span style="color:#6ee7b7">●</span> Jobs Monitor (2 min)</span>
+<span><span style="color:#a78bfa">●</span> Leads Agent (30 min)</span>
 </div>
 
 {f"<div class='alert'>⚠️ Profile not set up. <a href='{BASE}/profile' class='btn' style='padding:5px 12px;font-size:12px'>Set up profile →</a></div>" if not has_p else ""}
@@ -213,10 +263,16 @@ async def dashboard():
 <div class="cards">
 <div class="card"><div class="label">Profile</div><div class="value" style="font-size:18px">{profile_name}</div><div class="sub">{'✓ Set up' if has_p else 'Not configured'}</div></div>
 <div class="card"><div class="label">CV Uploaded</div><div class="value" style="font-size:18px">{'✓ Yes' if get_primary_cv() else '✕ No'}</div><div class="sub">{'<a href=\'' + BASE + '/cv\' style=\'color:#60a5fa\'>Manage CVs →</a>' if get_uploaded_cvs() else '<a href=\'' + BASE + '/cv\' style=\'color:#fcd34d\'>Upload CV →</a>'}</div></div>
-<div class="card"><div class="label">Jobs Discovered</div><div class="value">{job_count}</div><div class="sub">{new_count} new, {high_fit} high fit</div></div>
-<div class="card"><div class="label">Auto-Applied</div><div class="value">{applied_count}</div><div class="sub">Total: {total_applied}</div></div>
-<div class="card"><div class="label">Auto-Apply Threshold</div><div class="value">{threshold}</div><div class="sub">Min score to apply</div></div>
+<div class="card"><div class="label">💼 Jobs Discovered</div><div class="value">{job_count}</div><div class="sub">{new_count} new, {high_fit} high fit</div></div>
+<div class="card"><div class="label">📋 Auto-Applied</div><div class="value">{applied_count}</div><div class="sub">Total: {total_applied}</div></div>
 </div>
+
+{'<div class="cards" style="margin-top:15px">' if HAS_LEADS else ''}
+{f'''<div class="card" style="border-color:#a78bfa"><div class="label" style="color:#a78bfa">🎯 Leads Discovered</div><div class="value">{leads_count}</div><div class="sub">{leads_new} new, {leads_high} high fit</div></div>
+<div class="card" style="border-color:#a78bfa"><div class="label" style="color:#a78bfa">📞 Leads Contacted</div><div class="value">{leads_contacted}</div><div class="sub">{outreach_sent} messages sent</div></div>
+<div class="card"><div class="label">Auto-Apply Threshold</div><div class="value">{threshold}</div><div class="sub">Min score to apply</div></div>
+<div class="card" style="border-color:#f472b6"><div class="label" style="color:#f472b6">Quick Links</div><div class="value" style="font-size:14px"><a href="{BASE}/leads" style="color:#a78bfa">🎯 Leads</a> · <a href="{BASE}/outreach" style="color:#f472b6">✉️ Outreach</a> · <a href="{BASE}/gmail-login" style="color:#6ee7b7">🔐 Gmail</a></div></div>''' if HAS_LEADS else f'<div class="card"><div class="label">Auto-Apply Threshold</div><div class="value">{threshold}</div><div class="sub">Min score to apply</div></div>'}
+{'</div>' if HAS_LEADS else ''}
 
 <div class="section">
 <h2>Agent Control</h2>
@@ -427,6 +483,17 @@ async def profile_page():
 <div style="color:#475569;font-size:11px;margin-top:3px">Jobs with a fit score above this number will be auto-applied to. Lower = more applications. Recommended: 40-60.</div>
 </div>
 
+<div class="section" style="border-color:#a78bfa">
+<h2 style="color:#a78bfa">🎯 Leads & Freelancing Info</h2>
+<p style="color:#64748b;font-size:12px;margin-bottom:10px">Used by the Leads Agent to generate personalized proposals and cold outreach to startup founders.</p>
+<label>Services You Offer (comma-separated)</label>
+<input name="services" value="{', '.join(profile.get('services',[]))}" placeholder="Web Development, API Development, DevOps, Technical Consulting">
+<label>Hourly Rate (USD)</label>
+<input name="hourly_rate" value="{profile.get('hourly_rate','')}" placeholder="50">
+<label>Availability</label>
+<input name="availability" value="{profile.get('availability','Available immediately')}" placeholder="Available immediately / 2 weeks notice">
+</div>
+
 <div class="section">
 <h2>Experience (JSON)</h2>
 <label>Work Experience</label>
@@ -481,6 +548,17 @@ async def save_profile_form(request: Request):
                 profile[key] = json.loads(val)
             except json.JSONDecodeError:
                 profile[key] = []
+
+    # Leads / freelancing fields
+    services_val = form.get("services", "")
+    if services_val:
+        profile["services"] = [x.strip() for x in services_val.split(",") if x.strip()]
+    hourly_rate = form.get("hourly_rate", "")
+    if hourly_rate:
+        profile["hourly_rate"] = hourly_rate.strip()
+    availability = form.get("availability", "")
+    if availability:
+        profile["availability"] = availability.strip()
 
     save_profile(profile)
     log_activity("profile_updated", f"Profile updated for {profile.get('name','user')}")
@@ -595,23 +673,30 @@ async def credentials_page():
 {nav(active='credentials')}
 <div class="container">
 <h1>🔑 Login Accounts</h1>
-<p class="subtitle">Agent uses these credentials to log in to job sites and apply on your behalf</p>
+<p class="subtitle">Agent uses these credentials to log in to job sites, apply, and send cold emails on your behalf</p>
 
 <div class="section">
 <h2>Gmail / Google Account {has_gmail}</h2>
 <p style="color:#64748b;font-size:13px;margin-bottom:15px">
-    Used for Google login (Sign in with Google) and email+password logins on job sites.<br>
+    Used for Google login (Sign in with Google), email+password logins on job sites, AND sending cold emails to leads.<br>
     Current: <strong>{gmail_email_display}</strong>
+</p>
+<div style="display:flex;gap:15px;margin-bottom:15px;flex-wrap:wrap">
+<a href="{BASE}/gmail-login" class="btn" style="background:#8b5cf6">🔐 Login to Gmail (Browser)</a>
+</div>
+<p style="color:#64748b;font-size:12px;margin-bottom:10px">
+    <strong>Option A:</strong> Login via noVNC browser (above) — no app password needed, session persists for sending emails.<br>
+    <strong>Option B:</strong> Set Gmail App Password below (for SMTP sending — more reliable for bulk emails).
 </p>
 <form method="POST" action="{BASE}/credentials">
 <input type="hidden" name="type" value="gmail">
 <label>Gmail Email</label>
 <input name="gmail_email" type="email" value="{creds.get('gmail_email', '')}" placeholder="your.email@gmail.com">
-<label>Gmail Password</label>
-<input name="gmail_password" type="password" value="{creds.get('gmail_password', '')}" placeholder="Your Gmail password">
+<label>Gmail App Password (16 chars)</label>
+<input name="gmail_password" type="password" value="{creds.get('gmail_password', '')}" placeholder="xxxx xxxx xxxx xxxx">
 <div style="color:#f59e0b;font-size:11px;margin-top:5px">
-    ⚠️ Note: Google may require 2FA or show a security warning for automated logins. 
-    If login fails, you may need to enable "Less secure apps" or use an App Password.
+    ⚠️ Use a Gmail <strong>App Password</strong> (not your regular password). Generate one at: Google Account → Security → 2-Step Verification → App Passwords.
+    This is used for SMTP email sending to leads. For browser-based login, use the button above.
 </div>
 <button type="submit" class="btn" style="margin-top:15px">Save Gmail Credentials</button>
 </form>
@@ -917,7 +1002,7 @@ async function startBrowser(){{
         if (data.success) {{
             msg.innerHTML = '✅ Browser started! You can interact with it below.';
             document.getElementById('vnc-container').style.display = 'block';
-            document.getElementById('vnc-frame').src = '/novnc/vnc.html?autoconnect=true&resize=scale&path=novnc/websockify';
+            document.getElementById('vnc-frame').src = '/novnc/vnc_mobile.html?path=novnc/websockify&scale=true';
             document.getElementById('open-vnc-btn').style.display = 'inline-block';
         }} else {{
             msg.innerHTML = '❌ ' + (data.error || 'Failed to start');
@@ -947,7 +1032,7 @@ async function stopBrowser(){{
 }}
 
 function openVNC(){{
-    window.open('/novnc/vnc.html?autoconnect=true&resize=scale&path=novnc/websockify', '_blank');
+    window.open('/novnc/vnc_mobile.html?path=novnc/websockify&scale=true', '_blank');
 }}
 
 // Check status on load
@@ -956,7 +1041,7 @@ fetch('{BASE}/api/login-browser/status')
     .then(data => {{
         if (data.running) {{
             document.getElementById('vnc-container').style.display = 'block';
-            document.getElementById('vnc-frame').src = '/novnc/vnc.html?autoconnect=true&resize=scale&path=novnc/websockify';
+            document.getElementById('vnc-frame').src = '/novnc/vnc_mobile.html?path=novnc/websockify&scale=true';
             document.getElementById('open-vnc-btn').style.display = 'inline-block';
             document.getElementById('status-msg').innerHTML = '🟢 Browser is already running!';
         }}
@@ -2052,6 +2137,616 @@ async def api_ai_cover(job_id: str):
     if cover:
         return PlainTextResponse(cover, media_type="text/plain")
     return JSONResponse({"error": "AI generation failed"}, status_code=500)
+
+
+# ============================================================================
+# LEADS & OUTREACH ROUTES
+# ============================================================================
+
+if HAS_LEADS:
+
+    @app.get("/leads", response_class=HTMLResponse)
+    async def leads_dashboard():
+        state = get_leads_state()
+        config = get_leads_config()
+        db = get_db()
+        total_leads = db.execute("SELECT COUNT(*) as c FROM leads").fetchone()["c"]
+        new_leads = db.execute("SELECT COUNT(*) as c FROM leads WHERE status='new'").fetchone()["c"]
+        contacted = db.execute("SELECT COUNT(*) as c FROM leads WHERE status='contacted'").fetchone()["c"]
+        high_fit = db.execute("SELECT COUNT(*) as c FROM leads WHERE fit_score >= 60").fetchone()["c"]
+        total_msgs = db.execute("SELECT COUNT(*) as c FROM outreach_messages").fetchone()["c"]
+        sent_msgs = db.execute("SELECT COUNT(*) as c FROM outreach_messages WHERE status='sent'").fetchone()["c"]
+        db.close()
+
+        # Leads by source
+        db = get_db()
+        source_stats = db.execute(
+            "SELECT source, COUNT(*) as c FROM leads GROUP BY source ORDER BY c DESC"
+        ).fetchall()
+        db.close()
+        source_html = ""
+        for s in source_stats:
+            source_html += f"<div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #334155'><span>{s['source']}</span><strong>{s['c']}</strong></div>"
+
+        # Leads by type
+        db = get_db()
+        type_stats = db.execute(
+            "SELECT lead_type, COUNT(*) as c FROM leads GROUP BY lead_type ORDER BY c DESC"
+        ).fetchall()
+        db.close()
+        type_html = ""
+        for t in type_stats:
+            type_html += f"<div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #334155'><span style='color:#a78bfa'>{t['lead_type']}</span><strong>{t['c']}</strong></div>"
+
+        # Recent leads
+        db = get_db()
+        recent = db.execute(
+            "SELECT * FROM leads ORDER BY first_seen DESC LIMIT 10"
+        ).fetchall()
+        db.close()
+        recent_html = ""
+        for l in recent:
+            score = l["fit_score"] or 0
+            score_color = "#6ee7b7" if score >= 70 else "#fcd34d" if score >= 50 else "#94a3b8"
+            status_badge = {
+                "new": '<span style="background:#3b82f6;padding:2px 8px;border-radius:4px;font-size:11px">New</span>',
+                "contacted": '<span style="background:#16a34a;padding:2px 8px;border-radius:4px;font-size:11px">Contacted</span>',
+                "replied": '<span style="background:#8b5cf6;padding:2px 8px;border-radius:4px;font-size:11px">Replied!</span>',
+            }.get(l["status"], f'<span style="background:#475569;padding:2px 8px;border-radius:4px;font-size:11px">{l["status"]}</span>')
+            recent_html += f"""<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #334155">
+            <div><strong>{l['name'] or 'Unknown'}</strong> <span style="color:#64748b;font-size:12px">at {l['company'] or 'N/A'}</span><br><span style="font-size:11px;color:#64748b">{l['source']} · {l['lead_type']} · {l['contact_method'] or 'no contact'}</span></div>
+            <div style="display:flex;gap:10px;align-items:center">
+            <span style="color:{score_color};font-weight:bold;font-size:14px">{score:.0f}</span>
+            {status_badge}
+            <a href="{BASE}/lead/{l['id']}" class="btn btn-sec" style="padding:4px 10px;font-size:12px">View</a>
+            </div></div>"""
+
+        # Outreach capability
+        cap = get_outreach_capability()
+
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leads — Job Agent</title><style>{CSS}</style></head><body>
+{nav('leads')}
+<div class="container">
+<h1>🎯 Leads Dashboard</h1>
+<p class="subtitle">Discover startup founders, entrepreneurs & freelancer clients · Generate AI proposals · Send cold outreach</p>
+
+<div class="cards">
+<div class="card"><div class="label">Total Leads</div><div class="value">{total_leads}</div><div class="sub">{new_leads} new, {high_fit} high fit</div></div>
+<div class="card"><div class="label">Contacted</div><div class="value">{contacted}</div><div class="sub">{total_msgs} messages, {sent_msgs} sent</div></div>
+<div class="card"><div class="label">Discovered (all-time)</div><div class="value">{state.get('total_discovered',0) if state else 0}</div><div class="sub">Evaluated: {state.get('total_evaluated',0) if state else 0}</div></div>
+<div class="card"><div class="label">Outreached (all-time)</div><div class="value">{state.get('total_outreached',0) if state else 0}</div><div class="sub">Replied: {state.get('total_replied',0) if state else 0}</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:30px">
+<div class="section"><h2>By Source</h2>{source_html or '<p style="color:#64748b">No leads yet</p>'}</div>
+<div class="section"><h2>By Type</h2>{type_html or '<p style="color:#64748b">No leads yet</p>'}</div>
+</div>
+
+<div class="section">
+<h2>Outreach Capability</h2>
+<div style="display:flex;gap:15px;flex-wrap:wrap;margin-bottom:15px">
+<span style="padding:6px 14px;border-radius:8px;font-size:13px;background:{'#16a34a' if cap['smtp'] else '#475569'};color:white">Gmail SMTP: {'✓' if cap['smtp'] else '✕'}</span>
+<span style="padding:6px 14px;border-radius:8px;font-size:13px;background:{'#16a34a' if cap['gmail_browser'] else '#475569'};color:white">Gmail Browser: {'✓' if cap['gmail_browser'] else '✕'}</span>
+<span style="padding:6px 14px;border-radius:8px;font-size:13px;background:{'#16a34a' if cap['linkedin_browser'] else '#475569'};color:white">LinkedIn Browser: {'✓' if cap['linkedin_browser'] else '✕'}</span>
+</div>
+<div>
+<a href="{BASE}/gmail-login" class="btn">🔐 Login to Gmail</a>
+<a href="{BASE}/login-browser" class="btn btn-sec">🔗 Login to LinkedIn</a>
+<a href="{BASE}/leads-config" class="btn btn-sec">⚙ Leads Settings</a>
+</div>
+</div>
+
+<div class="section">
+<h2>Recent Leads</h2>
+{recent_html or '<p style="color:#64748b">No leads discovered yet. Run the agent to find leads.</p>'}
+<div style="margin-top:15px">
+<button class="btn btn-green" onclick="runLeadsCycle()">▶ Discover Leads Now</button>
+<button class="btn btn-sec" onclick="loadAllLeads()">View All Leads</button>
+</div>
+</div>
+
+<div id="leads-run-result"></div>
+</div>
+
+<script>
+async function runLeadsCycle() {{
+document.getElementById('leads-run-result').innerHTML = '<div style="padding:20px;text-align:center"><span class="spinner"></span><p style="margin-top:10px;color:#64748b">Discovering leads... this may take 1-2 minutes</p></div>';
+try {{
+const resp = await fetch('{BASE}/api/leads/run', {{method:'POST'}});
+const data = await resp.json();
+if (data.error) {{
+document.getElementById('leads-run-result').innerHTML = '<div class="alert-warn">⚠ ' + data.error + '</div>';
+}} else {{
+document.getElementById('leads-run-result').innerHTML = '<div class="alert-ok" style="padding:15px;border-radius:8px">✓ Discovered: ' + data.discovered + ', Enriched: ' + data.enriched + ', Evaluated: ' + data.evaluated + ', Outreached: ' + data.outreached + '</div>';
+setTimeout(() => location.reload(), 3000);
+}}
+}} catch(e) {{
+document.getElementById('leads-run-result').innerHTML = '<div class="alert-warn">Error: ' + e.message + '</div>';
+}}
+}}
+function loadAllLeads() {{ location.href = '{BASE}/leads/all'; }}
+</script>
+</body></html>"""
+
+    @app.get("/leads/all", response_class=HTMLResponse)
+    async def leads_all():
+        db = get_db()
+        leads = db.execute("SELECT * FROM leads ORDER BY fit_score DESC, first_seen DESC LIMIT 200").fetchall()
+        db.close()
+        rows_html = ""
+        for l in leads:
+            score = l["fit_score"] or 0
+            score_color = "#6ee7b7" if score >= 70 else "#fcd34d" if score >= 50 else "#94a3b8"
+            status_badge = {
+                "new": '<span style="background:#3b82f6;padding:2px 8px;border-radius:4px;font-size:11px">New</span>',
+                "contacted": '<span style="background:#16a34a;padding:2px 8px;border-radius:4px;font-size:11px">Contacted</span>',
+                "replied": '<span style="background:#8b5cf6;padding:2px 8px;border-radius:4px;font-size:11px">Replied!</span>',
+            }.get(l["status"], f'<span style="background:#475569;padding:2px 8px;border-radius:4px;font-size:11px">{l["status"]}</span>')
+            rows_html += f"""<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #334155">
+            <div style="flex:1">
+            <strong>{l['name'] or 'Unknown'}</strong> <span style="color:#64748b;font-size:12px">at {l['company'] or 'N/A'}</span><br>
+            <span style="font-size:11px;color:#64748b">{l['source']} · {l['lead_type']} · {l['industry'] or ''} · {l['stage'] or ''}</span><br>
+            <span style="font-size:11px;color:#64748b">📧 {l['email'] or 'no email'} · 🔗 {l['linkedin'] or 'no linkedin'}</span>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center">
+            <span style="color:{score_color};font-weight:bold;font-size:16px">{score:.0f}</span>
+            {status_badge}
+            <a href="{BASE}/lead/{l['id']}" class="btn btn-sec" style="padding:4px 10px;font-size:12px">View →</a>
+            </div></div>"""
+
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>All Leads — Job Agent</title><style>{CSS}</style></head><body>
+{nav('leads')}
+<div class="container">
+<h1>All Leads</h1>
+<p class="subtitle">{len(leads)} leads discovered</p>
+<div class="section">
+{rows_html or '<p style="color:#64748b">No leads yet.</p>'}
+</div>
+<a href="{BASE}/leads" class="btn btn-sec">← Back to Leads Dashboard</a>
+</div></body></html>"""
+
+    @app.get("/lead/{lead_id}", response_class=HTMLResponse)
+    async def lead_detail(lead_id: str):
+        lead = get_lead_by_id(lead_id)
+        if not lead:
+            return HTMLResponse("<h1>Lead not found</h1>", status_code=404)
+
+        score = lead.get("fit_score", 0) or 0
+        score_color = "#6ee7b7" if score >= 70 else "#fcd34d" if score >= 50 else "#94a3b8"
+
+        # Outreach messages for this lead
+        msgs = get_outreach_msgs(lead_id=lead_id)
+        msgs_html = ""
+        for m in msgs:
+            status_color = {"sent": "#6ee7b7", "draft": "#fcd34d", "failed": "#fca5a5"}.get(m["status"], "#94a3b8")
+            msgs_html += f"""<div style="background:#1e293b;border-radius:8px;padding:15px;margin-bottom:10px;border-left:3px solid {status_color}">
+            <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+            <strong>{m['message_type']}</strong>
+            <span style="color:{status_color};font-size:12px">{m['status']}</span>
+            </div>
+            {f"<div style='font-size:13px;color:#94a3b8;margin-bottom:8px'><strong>Subject:</strong> {m['subject']}</div>" if m['subject'] else ""}
+            <div style="font-size:13px;color:#cbd5e1;white-space:pre-wrap;max-height:300px;overflow:auto">{(m['content'] or '')[:1000]}{'...' if m['content'] and len(m['content']) > 1000 else ''}</div>
+            {f"<div style='font-size:11px;color:#64748b;margin-top:5px'>{m['result']}</div>" if m['result'] else ""}
+            </div>"""
+
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{lead.get('name','Lead')} — Job Agent</title><style>{CSS}</style></head><body>
+{nav('leads')}
+<div class="container">
+<a href="{BASE}/leads/all" class="btn btn-sec" style="margin-bottom:15px">← All Leads</a>
+<h1>{lead.get('name', 'Unknown Lead')}</h1>
+<p class="subtitle">{lead.get('title', '')} at {lead.get('company', 'N/A')} · {lead.get('source', '')} · {lead.get('lead_type', '')}</p>
+
+<div class="cards">
+<div class="card"><div class="label">Fit Score</div><div class="value" style="color:{score_color}">{score:.0f}</div><div class="sub">Lead quality</div></div>
+<div class="card"><div class="label">Status</div><div class="value" style="font-size:18px">{lead.get('status', 'new')}</div><div class="sub">{lead.get('contact_method', 'no method')}</div></div>
+<div class="card"><div class="label">Source</div><div class="value" style="font-size:18px">{lead.get('source', '')}</div><div class="sub">{lead.get('industry', '') or 'N/A'}</div></div>
+<div class="card"><div class="label">Stage</div><div class="value" style="font-size:18px">{lead.get('stage', '') or 'N/A'}</div><div class="sub">{lead.get('location', '') or 'N/A'}</div></div>
+</div>
+
+<div class="section">
+<h2>Company Info</h2>
+<p style="color:#cbd5e1;line-height:1.6">{lead.get('company_description', 'No description available') or 'No description available'}</p>
+{f"<p style='color:#94a3b8;margin-top:10px;font-size:13px'>{lead.get('description', '')}</p>" if lead.get('description') else ""}
+</div>
+
+<div class="section">
+<h2>Contact Details</h2>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:14px">
+<div>📧 Email: <strong style="color:{'#6ee7b7' if lead.get('email') else '#fca5a5'}">{lead.get('email', 'Not found') or 'Not found'}</strong></div>
+<div>🔗 LinkedIn: <strong style="color:{'#6ee7b7' if lead.get('linkedin') else '#fca5a5'}">{lead.get('linkedin', 'Not found') or 'Not found'}</strong></div>
+<div>🐦 Twitter: <strong style="color:{'#6ee7b7' if lead.get('twitter') else '#fca5a5'}">{lead.get('twitter', 'Not found') or 'Not found'}</strong></div>
+<div>🌐 Website: <strong style="color:{'#6ee7b7' if lead.get('website') else '#fca5a5'}">{lead.get('website', 'Not found') or 'Not found'}</strong></div>
+</div>
+</div>
+
+<div class="section">
+<h2>Outreach Actions</h2>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px">
+<button class="btn" onclick="genMessage('email')" id="gen-email-btn">📧 Generate Cold Email</button>
+<button class="btn btn-sec" onclick="genMessage('linkedin_dm')" id="gen-linkedin-btn">🔗 Generate LinkedIn DM</button>
+<button class="btn btn-sec" onclick="genMessage('twitter_dm')" id="gen-twitter-btn">🐦 Generate Twitter DM</button>
+<button class="btn btn-sec" onclick="genProposal()" id="gen-proposal-btn">📋 Generate Full Proposal</button>
+<button class="btn" onclick="enrichLead()" id="enrich-btn">🔍 Enrich Lead</button>
+</div>
+<div id="gen-result" style="margin-bottom:15px"></div>
+<div id="message-preview" style="display:none;background:#1e293b;border-radius:8px;padding:20px;margin-bottom:15px">
+<div style="display:flex;justify-content:space-between;margin-bottom:10px">
+<strong id="msg-type-label">Message</strong>
+<div><button class="btn" onclick="copyMessage()">📋 Copy</button> <button class="btn btn-green" onclick="sendMessage()">📤 Send</button></div>
+</div>
+<textarea id="msg-content" style="width:100%;min-height:250px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:12px;font-family:monospace;font-size:13px" readonly></textarea>
+<input type="hidden" id="msg-type">
+<input type="hidden" id="msg-subject">
+</div>
+</div>
+
+<div class="section">
+<h2>Outreach History</h2>
+{msgs_html or '<p style="color:#64748b">No messages sent yet.</p>'}
+</div>
+</div>
+
+<script>
+let currentMsg = {{}};
+async function genMessage(type) {{
+document.getElementById('gen-result').innerHTML = '<span class="spinner"></span> Generating ' + type + '...';
+const resp = await fetch(`{BASE}/api/leads/{lead_id}/generate?type=` + type, {{method:'POST'}});
+const data = await resp.json();
+if (data.error) {{ document.getElementById('gen-result').innerHTML = '<div class="alert-warn">⚠ ' + data.error + '</div>'; return; }}
+document.getElementById('gen-result').innerHTML = '<div class="alert-ok" style="padding:10px;border-radius:8px">✓ Generated!</div>';
+document.getElementById('msg-type-label').textContent = type;
+document.getElementById('msg-type').value = type;
+document.getElementById('msg-subject').value = data.subject || '';
+document.getElementById('msg-content').value = data.content;
+currentMsg = data;
+document.getElementById('message-preview').style.display = 'block';
+}}
+async function genProposal() {{
+document.getElementById('gen-result').innerHTML = '<span class="spinner"></span> Generating full proposal (may take 30-60s)...';
+const resp = await fetch(`{BASE}/api/leads/{lead_id}/generate?type=proposal`, {{method:'POST'}});
+const data = await resp.json();
+if (data.error) {{ document.getElementById('gen-result').innerHTML = '<div class="alert-warn">⚠ ' + data.error + '</div>'; return; }}
+document.getElementById('gen-result').innerHTML = '<div class="alert-ok" style="padding:10px;border-radius:8px">✓ Proposal generated!</div>';
+document.getElementById('msg-type-label').textContent = 'Full Proposal';
+document.getElementById('msg-type').value = 'proposal';
+document.getElementById('msg-subject').value = '';
+document.getElementById('msg-content').value = data.content;
+currentMsg = data;
+document.getElementById('message-preview').style.display = 'block';
+}}
+async function enrichLead() {{
+document.getElementById('gen-result').innerHTML = '<span class="spinner"></span> Enriching...';
+const resp = await fetch(`{BASE}/api/leads/{lead_id}/enrich`, {{method:'POST'}});
+const data = await resp.json();
+if (data.error) {{ document.getElementById('gen-result').innerHTML = '<div class="alert-warn">⚠ ' + data.error + '</div>'; return; }}
+document.getElementById('gen-result').innerHTML = '<div class="alert-ok">✓ Enriched! Email: ' + (data.email || 'none') + ', LinkedIn: ' + (data.linkedin || 'none') + '</div>';
+}}
+function copyMessage() {{ document.getElementById('msg-content').select(); document.execCommand('copy'); alert('Copied!'); }}
+async function sendMessage() {{
+if (!confirm('Send this message to the lead?')) return;
+document.getElementById('gen-result').innerHTML = '<span class="spinner"></span> Sending...';
+const resp = await fetch(`{BASE}/api/leads/{lead_id}/send`, {{
+method:'POST',
+headers:{{'Content-Type':'application/json'}},
+body: JSON.stringify({{type: document.getElementById('msg-type').value, content: document.getElementById('msg-content').value, subject: document.getElementById('msg-subject').value}})
+}});
+const data = await resp.json();
+if (data.success) {{ document.getElementById('gen-result').innerHTML = '<div class="alert-ok">✓ Sent! ' + data.message + '</div>'; setTimeout(()=>location.reload(), 2000); }}
+else {{ document.getElementById('gen-result').innerHTML = '<div class="alert-warn">⚠ ' + data.message + '</div>'; }}
+}}
+</script>
+</body></html>"""
+
+    @app.get("/leads-config", response_class=HTMLResponse)
+    async def leads_config_page():
+        config = get_leads_config()
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Leads Settings — Job Agent</title><style>{CSS}</style></head><body>
+{nav('leads')}
+<div class="container">
+<h1>⚙ Leads Agent Settings</h1>
+<form method="POST" action="{BASE}/leads-config" style="max-width:600px">
+<div class="section">
+<label style="display:block;margin-bottom:5px;color:#94a3b8">Search Keywords (for GitHub, etc.)</label>
+<input type="text" name="search_keywords" value="{config.get('search_keywords', 'startup saas platform app')}" style="width:100%;padding:10px;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#e2e8f0;margin-bottom:15px">
+
+<label style="display:block;margin-bottom:5px;color:#94a3b8">Max leads per source</label>
+<input type="number" name="max_per_source" value="{config.get('max_per_source', 20)}" style="width:100%;padding:10px;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#e2e8f0;margin-bottom:15px">
+
+<label style="display:block;margin-bottom:5px;color:#94a3b8">Outreach threshold (min fit score to auto-contact)</label>
+<input type="number" name="outreach_threshold" value="{config.get('outreach_threshold', 60)}" style="width:100%;padding:10px;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#e2e8f0;margin-bottom:15px">
+
+<label style="display:block;margin-bottom:5px;color:#94a3b8">Scan interval (minutes)</label>
+<input type="number" name="interval_minutes" value="{config.get('interval_minutes', 30)}" style="width:100%;padding:10px;background:#1e293b;border:1px solid #334155;border-radius:8px;color:#e2e8f0;margin-bottom:15px">
+
+<label style="display:flex;gap:10px;align-items:center;margin-bottom:15px">
+<input type="checkbox" name="auto_outreach" {'checked' if config.get('auto_outreach', False) else ''}>
+<span style="color:#94a3b8">Auto-send outreach to high-fit leads</span>
+</label>
+
+<button type="submit" class="btn">Save Settings</button>
+</div>
+</form>
+</div></body></html>"""
+
+    @app.post("/leads-config")
+    async def save_leads_config_form(
+        search_keywords: str = Form("startup saas platform app"),
+        max_per_source: int = Form(20),
+        outreach_threshold: int = Form(60),
+        interval_minutes: int = Form(30),
+        auto_outreach: str = Form(None),
+    ):
+        config = {
+            "search_keywords": search_keywords,
+            "max_per_source": max_per_source,
+            "outreach_threshold": outreach_threshold,
+            "interval_minutes": interval_minutes,
+            "auto_outreach": auto_outreach is not None,
+        }
+        update_leads_config(config)
+        return HTMLResponse(f'<meta http-equiv="refresh" content="2;url={BASE}/leads-config"><div style="padding:40px;text-align:center;color:#6ee7b7;font-size:18px">✓ Settings saved! Redirecting...</div>')
+
+    @app.get("/outreach", response_class=HTMLResponse)
+    async def outreach_page():
+        msgs = get_outreach_msgs(limit=100)
+        msgs_html = ""
+        for m in msgs:
+            status_color = {"sent": "#6ee7b7", "draft": "#fcd34d", "failed": "#fca5a5"}.get(m["status"], "#94a3b8")
+            lead_name = ""
+            db = get_db()
+            lead_row = db.execute("SELECT name, company FROM leads WHERE id=?", (m["lead_id"],)).fetchone()
+            db.close()
+            if lead_row:
+                lead_name = f"{lead_row['name']} at {lead_row['company']}"
+            msgs_html += f"""<div style="background:#1e293b;border-radius:8px;padding:15px;margin-bottom:10px;border-left:3px solid {status_color}">
+            <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+            <div><strong>{lead_name or m['lead_id']}</strong> <span style="color:#64748b;font-size:12px">· {m['message_type']}</span></div>
+            <span style="color:{status_color};font-size:12px">{m['status']}</span>
+            </div>
+            {f"<div style='font-size:13px;color:#94a3b8;margin-bottom:5px'><strong>Subject:</strong> {m['subject']}</div>" if m['subject'] else ""}
+            <div style="font-size:12px;color:#cbd5e1;white-space:pre-wrap;max-height:150px;overflow:auto">{(m['content'] or '')[:500]}{'...' if m['content'] and len(m['content']) > 500 else ''}</div>
+            {f"<div style='font-size:11px;color:#64748b;margin-top:5px'>{m['result']}</div>" if m['result'] else ""}
+            <a href="{BASE}/lead/{m['lead_id']}" class="btn btn-sec" style="padding:3px 10px;font-size:11px;margin-top:5px">View Lead →</a>
+            </div>"""
+
+        cap = get_outreach_capability()
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Outreach — Job Agent</title><style>{CSS}</style></head><body>
+{nav('outreach')}
+<div class="container">
+<h1>✉️ Outreach</h1>
+<p class="subtitle">Cold emails, LinkedIn DMs, and proposals sent to leads</p>
+
+<div class="cards">
+<div class="card"><div class="label">Total Messages</div><div class="value">{len(msgs)}</div></div>
+<div class="card"><div class="label">Sent</div><div class="value" style="color:#6ee7b7">{sum(1 for m in msgs if m['status']=='sent')}</div></div>
+<div class="card"><div class="label">Drafts</div><div class="value" style="color:#fcd34d">{sum(1 for m in msgs if m['status']=='draft')}</div></div>
+<div class="card"><div class="label">Failed</div><div class="value" style="color:#fca5a5">{sum(1 for m in msgs if m['status']=='failed')}</div></div>
+</div>
+
+<div class="section">
+<h2>Sending Channels</h2>
+<div style="display:flex;gap:15px;flex-wrap:wrap;margin-bottom:15px">
+<span style="padding:8px 16px;border-radius:8px;background:{'#16a34a' if cap['smtp'] else '#475569'};color:white">Gmail SMTP: {'✓ Active' if cap['smtp'] else '✕ Not configured'}</span>
+<span style="padding:8px 16px;border-radius:8px;background:{'#16a34a' if cap['gmail_browser'] else '#475569'};color:white">Gmail Browser: {'✓ Logged in' if cap['gmail_browser'] else '✕ Not logged in'}</span>
+<span style="padding:8px 16px;border-radius:8px;background:{'#16a34a' if cap['linkedin_browser'] else '#475569'};color:white">LinkedIn Browser: {'✓ Running' if cap['linkedin_browser'] else '✕ Not running'}</span>
+</div>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<a href="{BASE}/gmail-login" class="btn">🔐 Login to Gmail</a>
+<a href="{BASE}/login-browser" class="btn btn-sec">🔗 Login to LinkedIn</a>
+<a href="{BASE}/credentials" class="btn btn-sec">🔑 Set Gmail App Password</a>
+</div>
+</div>
+
+<div class="section">
+<h2>Outreach History</h2>
+{msgs_html or '<p style="color:#64748b">No messages yet. Go to a lead to generate and send outreach.</p>'}
+</div>
+</div></body></html>"""
+
+    @app.get("/gmail-login", response_class=HTMLResponse)
+    async def gmail_login_page():
+        status = gmail_login.status()
+        session = gmail_login.get_session_status()
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gmail Login — Job Agent</title><style>{CSS}</style></head><body>
+{nav('credentials')}
+<div class="container">
+<h1>🔐 Gmail Login</h1>
+<p class="subtitle">Log in to Gmail once — session persists for sending cold emails automatically</p>
+
+<div class="section">
+<h2>Session Status</h2>
+<div style="display:flex;gap:15px;align-items:center;margin-bottom:15px">
+<span style="padding:6px 14px;border-radius:8px;font-size:13px;background:{'#16a34a' if session.get('gmail_logged_in') else '#dc2626'};color:white">
+{'✓ Gmail Logged In' if session.get('gmail_logged_in') else '✕ Not Logged In'}
+</span>
+<span style="padding:6px 14px;border-radius:8px;font-size:13px;background:{'#16a34a' if status.get('running') else '#475569'};color:white">
+Browser: {'Running' if status.get('running') else 'Off'}
+</span>
+</div>
+{f"<p style='color:#64748b;font-size:13px'>Cookies found: {session.get('cookies_found',0)} · {', '.join(session.get('cookie_names',[]))}</p>" if session.get('cookies_found') else ""}
+</div>
+
+<div class="section">
+<h2>Login Browser</h2>
+<p style="color:#94a3b8;margin-bottom:15px">Click start to open a browser via noVNC. Log in to Gmail manually (solve 2FA/captcha). Click save when done.</p>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<button class="btn btn-green" onclick="startGmailBrowser()" id="gmail-start-btn">▶ Start Login Browser</button>
+<button class="btn" style="background:#dc2626;color:white" onclick="stopGmailBrowser()" id="gmail-stop-btn">⏹ Save & Stop</button>
+</div>
+<div id="gmail-result" style="margin-top:15px"></div>
+<div id="gmail-novnc-link" style="display:none;margin-top:15px">
+<div style="padding:15px;background:#1e293b;border-radius:8px;border:1px solid #334155">
+<strong style="color:#6ee7b7">Browser is running!</strong><br>
+<a href="/gmail-novnc/vnc_mobile.html?path=gmail-novnc/websockify&scale=true" target="_blank" class="btn" style="margin-top:10px">🌐 Open Gmail in Browser →</a>
+<p style="color:#64748b;font-size:12px;margin-top:8px">Mobile: tap ⌨️ Keyboard button to type. Log in to Gmail, then click "Save & Stop".</p>
+</div>
+</div>
+</div>
+</div>
+
+<script>
+async function startGmailBrowser() {{
+document.getElementById('gmail-result').innerHTML = '<span class="spinner"></span> Starting browser...';
+const resp = await fetch('{BASE}/api/gmail-browser/start', {{method:'POST'}});
+const data = await resp.json();
+if (data.success) {{
+document.getElementById('gmail-result').innerHTML = '<div class="alert-ok" style="padding:10px;border-radius:8px">✓ Browser started!</div>';
+document.getElementById('gmail-novnc-link').style.display = 'block';
+}} else {{
+document.getElementById('gmail-result').innerHTML = '<div class="alert-warn">⚠ ' + (data.error || data.message || 'Failed') + '</div>';
+}}
+}}
+async function stopGmailBrowser() {{
+document.getElementById('gmail-result').innerHTML = '<span class="spinner"></span> Saving session...';
+const resp = await fetch('{BASE}/api/gmail-browser/stop', {{method:'POST'}});
+const data = await resp.json();
+document.getElementById('gmail-result').innerHTML = '<div class="' + (data.has_session ? 'alert-ok' : 'alert-warn') + '" style="padding:10px;border-radius:8px">' + data.message + '</div>';
+document.getElementById('gmail-novnc-link').style.display = 'none';
+setTimeout(() => location.reload(), 3000);
+}}
+</script>
+</body></html>"""
+
+    # --- API Endpoints for Leads ---
+
+    @app.get("/api/leads")
+    async def api_leads(limit: int = 100, status: str = None):
+        leads = get_all_leads_db(limit=limit, status=status)
+        return JSONResponse(leads)
+
+    @app.get("/api/leads/state")
+    async def api_leads_state():
+        return JSONResponse(get_leads_state())
+
+    @app.get("/api/leads/config")
+    async def api_leads_config_get():
+        return JSONResponse(get_leads_config())
+
+    @app.post("/api/leads/config")
+    async def api_leads_config_save(request: Request):
+        body = await request.json()
+        update_leads_config(body)
+        return JSONResponse({"success": True})
+
+    @app.post("/api/leads/run")
+    async def api_leads_run():
+        try:
+            result = run_leads_cycle()
+            return JSONResponse(result)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.get("/api/leads/{lead_id}")
+    async def api_lead_detail(lead_id: str):
+        lead = get_lead_by_id(lead_id)
+        if not lead:
+            return JSONResponse({"error": "Lead not found"}, status_code=404)
+        return JSONResponse(lead)
+
+    @app.post("/api/leads/{lead_id}/generate")
+    async def api_lead_generate(lead_id: str, type: str = "email"):
+        lead = get_lead_by_id(lead_id)
+        if not lead:
+            return JSONResponse({"error": "Lead not found"}, status_code=404)
+        profile = get_profile()
+        if not profile:
+            return JSONResponse({"error": "Profile not set up"}, status_code=400)
+
+        if type == "email":
+            content = generate_cold_email(profile, lead)
+            subject = ""
+            if content and content.startswith("Subject:"):
+                parts = content.split("\n", 1)
+                subject = parts[0].replace("Subject:", "").strip()
+                content = parts[1].strip() if len(parts) > 1 else content
+            return JSONResponse({"content": content, "subject": subject, "type": "email"})
+        elif type == "linkedin_dm":
+            content = generate_linkedin_dm(profile, lead)
+            return JSONResponse({"content": content, "type": "linkedin_dm"})
+        elif type == "twitter_dm":
+            content = generate_twitter_dm(profile, lead)
+            return JSONResponse({"content": content, "type": "twitter_dm"})
+        elif type == "proposal":
+            content = generate_full_proposal(profile, lead)
+            return JSONResponse({"content": content, "type": "proposal"})
+        else:
+            return JSONResponse({"error": "Unknown type"}, status_code=400)
+
+    @app.post("/api/leads/{lead_id}/enrich")
+    async def api_lead_enrich(lead_id: str):
+        lead = get_lead_by_id(lead_id)
+        if not lead:
+            return JSONResponse({"error": "Lead not found"}, status_code=404)
+        lead_obj = Lead(**{k: lead[k] for k in Lead.__dataclass_fields__ if k in lead})
+        enriched = enrich_lead(lead_obj)
+        db = get_db()
+        db.execute("""UPDATE leads SET email=?, linkedin=?, twitter=?, website=?,
+            company_description=?, contact_method=?, enriched=1 WHERE id=?""",
+            (enriched.email, enriched.linkedin, enriched.twitter, enriched.website,
+             enriched.company_description, enriched.contact_method, lead_id))
+        db.commit()
+        db.close()
+        return JSONResponse({"email": enriched.email, "linkedin": enriched.linkedin,
+                            "twitter": enriched.twitter, "website": enriched.website,
+                            "contact_method": enriched.contact_method})
+
+    @app.post("/api/leads/{lead_id}/send")
+    async def api_lead_send(lead_id: str, request: Request):
+        lead = get_lead_by_id(lead_id)
+        if not lead:
+            return JSONResponse({"error": "Lead not found"}, status_code=404)
+        body = await request.json()
+        msg_type = body.get("type", "email")
+        content = body.get("content", "")
+        subject = body.get("subject", "")
+
+        # Save message
+        msg_id = save_outreach_message(lead_id, msg_type, subject, content, status="draft")
+
+        # Send
+        result = send_outreach(lead, msg_type, content, email_subject=subject)
+
+        if result["success"]:
+            update_outreach_message(msg_id, "sent", result["message"])
+            update_lead_status_db(lead_id, "contacted")
+            return JSONResponse({"success": True, "message": result["message"]})
+        else:
+            update_outreach_message(msg_id, "failed", result["message"])
+            return JSONResponse({"success": False, "message": result["message"]})
+
+    # --- Gmail Browser API ---
+
+    @app.post("/api/gmail-browser/start")
+    async def api_gmail_browser_start():
+        result = gmail_login.start()
+        return JSONResponse(result)
+
+    @app.post("/api/gmail-browser/stop")
+    async def api_gmail_browser_stop():
+        result = gmail_login.stop()
+        return JSONResponse(result)
+
+    @app.get("/api/gmail-browser/status")
+    async def api_gmail_browser_status():
+        status = gmail_login.status()
+        session = gmail_login.get_session_status()
+        return JSONResponse({**status, **session})
+
+    @app.get("/api/outreach/capability")
+    async def api_outreach_capability():
+        return JSONResponse(get_outreach_capability())
 
 
 if __name__ == "__main__":

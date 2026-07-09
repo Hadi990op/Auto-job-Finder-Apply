@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Leads Agent — Startup Founders & Client Discovery
+After=network.target job-agent.service
+
+[Service]
+Type=simple
+ExecStart=/opt/venv-jobagent/bin/python /opt/job-agent/leads_agent.py --loop 30
+Restart=on-failure
+RestartSec=30
+WorkingDirectory=/opt/job-agent
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
