@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Job Agent — Real-Time Monitor
+After=network.target job-agent.service
+
+[Service]
+Type=simple
+ExecStart=/opt/venv-jobagent/bin/python /opt/job-agent/agent.py --loop 2
+Restart=on-failure
+RestartSec=30
+WorkingDirectory=/opt/job-agent
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

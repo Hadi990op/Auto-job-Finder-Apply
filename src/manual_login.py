@@ -38,6 +38,8 @@ PIDS_FILE = BASE_DIR / "data" / "manual_login_pids.txt"
 VNC_DISPLAY = ":99"
 VNC_PORT = 5999
 NOVNC_PORT = 6080
+DEBUG_PORT = 9222
+COOKIES_FILE = BASE_DIR / "data" / "saved_cookies.json"
 
 
 def _save_pids(pids: dict):
@@ -113,6 +115,7 @@ def start(url: str = "https://www.linkedin.com/login"):
         "--lang=en-US",
         "--no-first-run",
         "--no-default-browser-check",
+        "--remote-debugging-port=9222",
         url,
     ]
     chromium = subprocess.Popen(
@@ -168,8 +171,72 @@ def status():
     }
 
 
+def _graceful_browser_close():
+    """Connect to running Chromium via CDP, save cookies, then close gracefully."""
+    cookies_saved = []
+    try:
+        import urllib.request
+        import json as _json
+
+        # Check if debug port is active
+        try:
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{DEBUG_PORT}/json/version", timeout=3)
+            _ = _json.loads(resp.read())
+        except Exception:
+            return {"success": False, "error": "Debug port not reachable", "cookies": []}
+
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
+            
+            # Get all cookies from all contexts
+            all_cookies = []
+            for ctx in browser.contexts:
+                all_cookies.extend(ctx.cookies())
+            
+            # Also check pages for localStorage/sessionStorage if needed
+            for ctx in browser.contexts:
+                for pg in ctx.pages:
+                    try:
+                        # Try to get session cookies from JS
+                        extra = pg.evaluate("""() => {
+                            try { return document.cookie; } catch(e) { return ''; }
+                        }""")
+                        if extra and 'li_at' in str(extra):
+                            pass  # cookies already captured via API
+                    except Exception:
+                        pass
+            
+            # Save all cookies to JSON file
+            COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(COOKIES_FILE, 'w') as f:
+                _json.dump(all_cookies, f, indent=2)
+            
+            cookies_saved = [c['name'] for c in all_cookies if 'linkedin' in c.get('domain', '')]
+            
+            # Close browser gracefully — this flushes cookies to disk
+            try:
+                browser.close()
+            except Exception:
+                pass
+            
+            # Give it time to flush
+            time.sleep(3)
+            
+        return {"success": True, "cookies": cookies_saved}
+    except Exception as e:
+        return {"success": False, "error": str(e), "cookies": []}
+
+
 def stop():
     pids = _load_pids()
+    
+    # Try graceful close first — saves session cookies (li_at etc.)
+    cookie_result = {"success": False, "cookies": []}
+    if _is_running(pids.get("chromium", 0)):
+        cookie_result = _graceful_browser_close()
+    
+    # Now kill all processes
     for key in ["websockify", "x11vnc", "chromium", "xvfb"]:
         pid = pids.get(key)
         if pid:
@@ -180,7 +247,20 @@ def stop():
     except FileNotFoundError:
         pass
 
-    return {"success": True, "message": "Login browser stopped. Session saved to browser_profile."}
+    # Build message based on cookie save result
+    if cookie_result.get("success") and cookie_result.get("cookies"):
+        linkedin_cookies = cookie_result["cookies"]
+        has_li_at = "li_at" in linkedin_cookies
+        msg = f"Login browser stopped. LinkedIn cookies saved: {', '.join(linkedin_cookies)}"
+        if has_li_at:
+            msg += " ✅ LinkedIn session saved (li_at found)!"
+        else:
+            msg += " ⚠️ No li_at cookie — login may not have completed."
+        return {"success": True, "message": msg, "cookies": linkedin_cookies, "has_li_at": has_li_at}
+    elif cookie_result.get("success"):
+        return {"success": True, "message": "Login browser stopped. No LinkedIn cookies found."}
+    else:
+        return {"success": True, "message": f"Login browser stopped. Cookie save note: {cookie_result.get('error', 'N/A')}", "cookies": []}
 
 
 def get_session_status():
@@ -190,6 +270,23 @@ def get_session_status():
         return {"linkedin_logged_in": False, "message": "No browser profile cookies found."}
 
     try:
+        # First check saved_cookies.json (from CDP graceful close)
+        saved_cookies = []
+        if COOKIES_FILE.exists():
+            import json as _json
+            with open(COOKIES_FILE) as f:
+                saved_cookies = _json.load(f)
+            li_cookies = [c['name'] for c in saved_cookies if 'linkedin' in c.get('domain', '')]
+            has_li_at = 'li_at' in li_cookies
+            if has_li_at:
+                return {
+                    "linkedin_logged_in": True,
+                    "cookies_found": len(saved_cookies),
+                    "cookie_names": li_cookies,
+                    "message": "LinkedIn session active (li_at found in saved cookies)",
+                    "source": "saved_cookies.json"
+                }
+
         tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         tmp.close()
         shutil.copy2(cookie_db, tmp.name)

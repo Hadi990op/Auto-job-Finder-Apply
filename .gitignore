@@ -1,25 +1,14 @@
-# Python
+# Sensitive data — never commit
+*.db
+*.json
+data/saved_cookies.json
+data/browser_profile/
+data/proofs/
+data/cvs/
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
+.env
+*.log
 
-# Runtime data
-src/data/jobagent.db
-src/data/whatsapp/session/
-src/data/whatsapp/*.png
-src/data/cvs/*
-
-# Keep these (empty dirs with .gitkeep)
-!src/data/cvs/.gitkeep
-!src/data/whatsapp/.gitkeep
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
+# Keep data dir structure
+!data/.gitkeep

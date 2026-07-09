@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Job Agent — Persistent Browser (LinkedIn session)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/venv-jobagent/bin/python /opt/job-agent/persistent_browser.py start
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/opt/job-agent
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:99
+
+[Install]
+WantedBy=multi-user.target
