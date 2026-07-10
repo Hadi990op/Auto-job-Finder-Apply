@@ -114,13 +114,19 @@ def send_email_via_browser(to_email: str, subject: str, body: str,
     """
     Send an email via the persistent Gmail browser (if logged in).
     Opens Gmail compose in the browser and fills in the fields.
+    Tries port 9333 (dedicated Gmail browser) then 9222 (shared browser).
     """
     try:
         import urllib.request
-        # Check if browser is running
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json/version", timeout=3)
-        except Exception:
+        # Check if browser is running on specified port, try 9222 as fallback
+        for port in [debug_port, 9222]:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3)
+                debug_port = port
+                break
+            except Exception:
+                continue
+        else:
             return {"success": False, "message": "Gmail browser not running. Start it from Dashboard → Login to Gmail."}
 
         from playwright.sync_api import sync_playwright
@@ -458,33 +464,27 @@ def send_linkedin_dm(profile_url: str, message: str, debug_port: int = 9222) -> 
 def send_website_form(website_url: str, subject: str, body: str, profile: dict = None) -> dict:
     """
     Navigate to a lead's website and fill out their contact form.
-    Uses the Gmail browser (CDP 9333) or any available browser.
+    Uses a standalone headless Playwright browser (no CDP dependency).
     """
     page = None
     pw = None
+    browser = None
     try:
-        import urllib.request
-        # Try Gmail browser first (CDP 9333), then LinkedIn browser (CDP 9222)
-        debug_port = 9333
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json/version", timeout=3)
-        except Exception:
-            debug_port = 9222
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{debug_port}/json/version", timeout=3)
-            except Exception:
-                return {"success": False, "message": "No browser running for website form fill"}
-
         from playwright.sync_api import sync_playwright
 
         pw = sync_playwright().start()
-        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{debug_port}")
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        )
         page = context.new_page()
 
         # Navigate to the website
-        page.goto(website_url, wait_until="domcontentloaded", timeout=20000)
-        time.sleep(3)
+        page.goto(website_url, wait_until="domcontentloaded", timeout=10000)
+        time.sleep(2)
 
         # Look for a contact page link
         contact_selectors = [
@@ -500,7 +500,7 @@ def send_website_form(website_url: str, subject: str, body: str, profile: dict =
                 link = page.query_selector(sel)
                 if link and link.is_visible():
                     link.click()
-                    time.sleep(3)
+                    time.sleep(2)
                     break
             except:
                 continue
@@ -589,7 +589,7 @@ def send_website_form(website_url: str, subject: str, body: str, profile: dict =
                 btn = page.query_selector(sel)
                 if btn and btn.is_visible():
                     btn.click()
-                    time.sleep(3)
+                    time.sleep(2)
                     return {"success": True, "message": "Website contact form submitted"}
             except:
                 continue
@@ -602,6 +602,11 @@ def send_website_form(website_url: str, subject: str, body: str, profile: dict =
         if page:
             try:
                 page.close()
+            except:
+                pass
+        if browser:
+            try:
+                browser.close()
             except:
                 pass
         if pw:

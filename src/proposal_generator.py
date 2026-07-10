@@ -363,10 +363,10 @@ ANGLE: [one sentence on the best angle for outreach]"""
     result = _ai_chat_post([
         {"role": "system", "content": "You are an expert business development advisor. Evaluate lead fit precisely. Follow the output format exactly."},
         {"role": "user", "content": prompt}
-    ], timeout=45, retries=2)
+    ], timeout=25, retries=1)
 
     if not result:
-        result = _ai_chat_get(prompt[:2000], timeout=45)
+        result = _ai_chat_get(prompt[:2000], timeout=20)
 
     if not result:
         return None

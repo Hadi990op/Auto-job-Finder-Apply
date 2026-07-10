@@ -342,7 +342,7 @@ def run_leads_cycle():
     # --- Phase 2: Enrich ---
     log_activity("leads_enrichment_start", f"Enriching {new_count} new leads...")
     enriched_count = 0
-    new_leads = get_new_leads(limit=50)
+    new_leads = get_new_leads(limit=20)
     for lead in new_leads:
         try:
             lead_obj = Lead(**{k: lead[k] for k in Lead.__dataclass_fields__ if k in lead})
@@ -368,7 +368,7 @@ def run_leads_cycle():
     evaluated_count = 0
     db = get_db()
     unevaluated = db.execute(
-        "SELECT * FROM leads WHERE enriched=1 AND evaluated=0 LIMIT 50"
+        "SELECT * FROM leads WHERE enriched=1 AND evaluated=0 LIMIT 15"
     ).fetchall()
     db.close()
 

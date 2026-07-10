@@ -81,18 +81,20 @@ HEADERS = {
 }
 
 
-def _fetch(url: str, timeout: int = 20) -> str:
+def _fetch(url: str, timeout: int = 8) -> str:
     """Fetch a URL and return HTML text."""
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
+            data = resp.read()
+            # Limit response size to 500KB to avoid huge pages
+            return data[:500000].decode("utf-8", errors="replace")
     except Exception as e:
         print(f"  [Leads] Fetch error for {url}: {e}")
         return ""
 
 
-def _fetch_json(url: str, timeout: int = 20) -> dict:
+def _fetch_json(url: str, timeout: int = 8) -> dict:
     """Fetch a URL and return parsed JSON."""
     try:
         req = urllib.request.Request(url, headers={**HEADERS, "Accept": "application/json"})
@@ -467,10 +469,14 @@ def scrape_github_founders(max_results: int = 20, keywords: str = "startup saas 
         description = repo.get("description", "") or ""
         topics = repo.get("topics", [])
         stars = repo.get("stargazers_count", 0)
+        homepage = repo.get("homepage", "") or ""
 
         # Skip if too many stars (well-funded) — keep low-star repos (early stage builders)
         if stars > 5000 or stars < 1:
             continue
+
+        # Use homepage if available (actual website), otherwise repo URL
+        website = homepage if homepage and homepage.startswith("http") else repo_url
 
         leads.append(Lead(
             name=owner_name,
@@ -479,7 +485,7 @@ def scrape_github_founders(max_results: int = 20, keywords: str = "startup saas 
             company_url=repo_url,
             company_description=description,
             industry=", ".join(topics) if topics else "",
-            website=repo_url,
+            website=website,
             source="github",
             source_url=owner_url,
             lead_type="entrepreneur",
@@ -502,16 +508,22 @@ def scrape_job_boards_for_founders(max_results: int = 20) -> list:
     # RemoteOK
     data = _fetch_json("https://remoteok.com/api")
     if data and isinstance(data, list):
-        for job in data[1:][:max_results]:  # Skip first item (metadata)
+        seen_companies = set()
+        for job in data[1:][:max_results * 3]:  # Check more to find unique companies
             if not isinstance(job, dict):
                 continue
             company = job.get("company", "")
-            if not company:
+            if not company or company in seen_companies:
                 continue
+            seen_companies.add(company)
             company_url = job.get("company_url", "")
             position = job.get("position", "")
             tags = job.get("tags", [])
             description = job.get("description", "")[:500]
+            # Try to build a website URL from company name if not provided
+            if not company_url:
+                slug = company.lower().replace(" ", "").replace(",", "")
+                company_url = f"https://{slug}.com"
 
             leads.append(Lead(
                 name=company,
@@ -520,14 +532,158 @@ def scrape_job_boards_for_founders(max_results: int = 20) -> list:
                 company_url=company_url,
                 company_description=f"Hiring for: {position}",
                 industry=", ".join(tags) if tags else "",
-                website=company_url,
+                website=company_url if company_url.startswith("http") else "",
                 source="remoteok",
                 source_url=job.get("url", ""),
                 lead_type="founder",
                 description=description,
             ))
+            if len(leads) >= max_results:
+                break
 
     print(f"  [Leads] Job boards: found {len(leads)} hiring company leads")
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# Source 8: GitHub repos WITH homepages (actual product websites)
+# ---------------------------------------------------------------------------
+
+def scrape_github_with_homepages(max_results: int = 20, keywords: str = "saas platform") -> list:
+    """
+    Search GitHub for repos that have a homepage URL set — these are actual
+    products/startups with real websites, not just code repos.
+    """
+    print(f"  [Leads] Searching GitHub for repos with homepages (keywords: {keywords})...")
+    leads = []
+
+    # Search for repos with homepages — add "has:homepage" isn't a GitHub filter,
+    # but we can filter client-side. Use a more targeted search.
+    query = urllib.parse.quote(f"{keywords} stars:1..2000")
+    url = f"https://api.github.com/search/repositories?q={query}&sort=updated&per_page={max_results * 3}"
+    data = _fetch_json(url)
+
+    if not data or "items" not in data:
+        return []
+
+    count = 0
+    for repo in data.get("items", []):
+        if count >= max_results:
+            break
+
+        owner = repo.get("owner", {})
+        owner_name = owner.get("login", "")
+        owner_type = owner.get("type", "")
+        if owner_type != "User":
+            continue
+
+        homepage = repo.get("homepage", "") or ""
+        if not homepage or not homepage.startswith("http"):
+            continue  # Skip repos without a real homepage
+
+        repo_name = repo.get("name", "")
+        repo_url = repo.get("html_url", "")
+        description = repo.get("description", "") or ""
+        topics = repo.get("topics", [])
+        stars = repo.get("stargazers_count", 0)
+
+        leads.append(Lead(
+            name=owner_name,
+            title="Developer / Founder",
+            company=repo_name,
+            company_url=repo_url,
+            company_description=description,
+            industry=", ".join(topics) if topics else "",
+            website=homepage,
+            source="github",
+            source_url=owner.get("html_url", ""),
+            lead_type="entrepreneur",
+            description=f"GitHub repo: {repo_name} ({stars} stars, homepage: {homepage}). {description[:200]}",
+        ))
+        count += 1
+
+    print(f"  [Leads] GitHub (homepages): found {len(leads)} leads with real websites")
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# Source 9: Hacker News "Who is Hiring" thread
+# ---------------------------------------------------------------------------
+
+def scrape_hn_who_is_hiring(max_results: int = 20) -> list:
+    """
+    Scrape Hacker News "Who is Hiring" thread for companies hiring.
+    These are high-quality leads — companies actively looking for developers.
+    """
+    print("  [Leads] Scraping Hacker News Who is Hiring...")
+    leads = []
+
+    try:
+        # Find the latest "Ask HN: Who is hiring" thread
+        # Search HN Algolia API
+        search_url = "https://hn.algolia.com/api/v1/search?query=Ask+HN+Who+is+hiring&tags=story&hitsPerPage=1"
+        data = _fetch_json(search_url)
+        if not data or "hits" not in data or not data["hits"]:
+            return []
+
+        thread = data["hits"][0]
+        thread_id = thread.get("objectID", "")
+        if not thread_id:
+            return []
+
+        # Get comments (job postings) from the thread
+        comments_url = f"https://hn.algolia.com/api/v1/search?tags=comment,story_{thread_id}&hitsPerPage={max_results}"
+        comments_data = _fetch_json(comments_url)
+        if not comments_data or "hits" not in comments_data:
+            return []
+
+        for hit in comments_data["hits"][:max_results]:
+            text = hit.get("comment_text", "") or hit.get("story_text", "") or ""
+            author = hit.get("author", "")
+            url = hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}"
+
+            # Parse the comment for company name and contact info
+            # HN who-is-hiring posts typically start with: "Company Name | Location | Role"
+            lines = text.split("\n")
+            first_line = lines[0] if lines else ""
+            # Strip HTML tags
+            first_line = re.sub(r"<[^>]+>", "", first_line).strip()
+
+            # Extract email from the comment
+            email = _extract_emails_from_html(text)
+
+            # Extract URLs from comment
+            urls_in_text = re.findall(r'https?://[^\s<>"\']+', re.sub(r"<[^>]+>", " ", text))
+
+            # Use first line as company/description
+            company_name = first_line.split("|")[0].strip() if "|" in first_line else first_line[:50]
+            if not company_name:
+                company_name = f"HN User ({author})"
+
+            website = ""
+            for u in urls_in_text:
+                if "ycombinator" not in u and "hn.algolia" not in u:
+                    website = u
+                    break
+
+            leads.append(Lead(
+                name=company_name,
+                title="Hiring Company",
+                company=company_name,
+                company_url=website or url,
+                company_description=first_line[:300],
+                email=email,
+                website=website,
+                source="hackernews",
+                source_url=url,
+                lead_type="founder",
+                description=re.sub(r"<[^>]+>", "", text)[:500],
+            ))
+
+    except Exception as e:
+        print(f"  [Leads] HN error: {e}")
+
+    print(f"  [Leads] Hacker News: found {len(leads)} hiring leads")
     return leads
 
 
@@ -544,13 +700,15 @@ def discover_all_leads(max_per_source: int = 30, keywords: str = "startup saas p
     seen_ids = set()
 
     sources = [
+        ("github_homepages", lambda: scrape_github_with_homepages(max_per_source, keywords)),
+        ("github", lambda: scrape_github_founders(20, keywords)),
+        ("remoteok", lambda: scrape_job_boards_for_founders(max_per_source)),
+        ("hackernews", lambda: scrape_hn_who_is_hiring(max_per_source)),
         ("ycombinator", lambda: scrape_yc_companies(max_per_source)),
         ("producthunt", lambda: scrape_producthunt(max_per_source)),
         ("wellfound", lambda: scrape_wellfound(max_per_source)),
         ("freelancer", lambda: scrape_freelancer_reviews(max_per_source)),
         ("indiehackers", lambda: scrape_indiehackers(max_per_source)),
-        ("github", lambda: scrape_github_founders(20, keywords)),
-        ("remoteok", lambda: scrape_job_boards_for_founders(max_per_source)),
     ]
 
     for name, scraper in sources:
@@ -570,11 +728,17 @@ def discover_all_leads(max_per_source: int = 30, keywords: str = "startup saas p
 
 def _extract_emails_from_html(html: str) -> str:
     """Extract real email addresses from HTML, filtering out generic ones."""
-    email_pattern = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+    # Strict email pattern — requires a valid TLD (2+ alpha chars only)
+    email_pattern = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
     emails = email_pattern.findall(html)
     # Filter out generic emails but KEEP contact@ and info@ (they're still valid for outreach)
-    generic_block = {"noreply@", "admin@", "no-reply@", "sentry@", "wixpress@", "squarespace@"}
-    real_emails = [e for e in emails if not any(g in e.lower() for g in generic_block)]
+    generic_block = {"noreply@", "admin@", "no-reply@", "sentry@", "wixpress@", "squarespace@", "checkout@", "noreply+"}
+    # Also filter out placeholder/example emails
+    placeholder_patterns = ["your-email", "example@", "test@", "demo@", "user@", "email@",
+                           "you@", "changeme", "placeholder", "yourname"]
+    real_emails = [e for e in emails
+                   if not any(g in e.lower() for g in generic_block)
+                   and not any(p in e.lower() for p in placeholder_patterns)]
     return real_emails[0] if real_emails else ""
 
 
@@ -595,6 +759,26 @@ def enrich_lead(lead: Lead) -> Lead:
     if lead.website and lead.website != lead.source_url:
         urls_to_check.append(lead.website)
 
+    # Skip fetching github.com URLs — they won't have contact info
+    urls_to_check = [u for u in urls_to_check if "github.com" not in u]
+
+    # For GitHub leads, also check the user's public profile API for email
+    if lead.source == "github" and lead.name:
+        try:
+            user_data = _fetch_json(f"https://api.github.com/users/{lead.name}")
+            if user_data and user_data.get("email"):
+                lead.email = user_data["email"]
+            if user_data and user_data.get("blog") and not lead.website:
+                blog = user_data["blog"]
+                if not blog.startswith("http"):
+                    blog = "https://" + blog
+                lead.website = blog
+                urls_to_check.append(blog)
+            if user_data and user_data.get("twitter_username") and not lead.twitter:
+                lead.twitter = f"https://twitter.com/{user_data['twitter_username']}"
+        except Exception as e:
+            print(f"  [Leads] GitHub user API error for {lead.name}: {e}")
+
     for url in urls_to_check:
         try:
             html = _fetch(url, timeout=15)
@@ -603,7 +787,17 @@ def enrich_lead(lead: Lead) -> Lead:
 
             soup = BeautifulSoup(html, "lxml")
 
-            # Extract email from page
+            # Extract email from mailto: links first (most reliable)
+            if not lead.email:
+                mailto_links = soup.select("a[href^='mailto:']")
+                for ml in mailto_links:
+                    href = ml.get("href", "")
+                    addr = href.replace("mailto:", "").split("?")[0].strip()
+                    if addr and "@" in addr and not any(g in addr.lower() for g in {"noreply", "no-reply", "sentry", "wixpress", "squarespace"}):
+                        lead.email = addr
+                        break
+
+            # Extract email from page text
             if not lead.email:
                 lead.email = _extract_emails_from_html(html)
 
@@ -612,6 +806,8 @@ def enrich_lead(lead: Lead) -> Lead:
                 for contact_sel in [
                     "a[href*='contact']", "a[href*='Contact']",
                     "a[href*='/about']", "a[href*='about']",
+                    "a[href*='/team']", "a[href*='team']",
+                    "a[href*='/privacy']", "a[href*='privacy']",
                 ]:
                     try:
                         link = soup.select_one(contact_sel)
@@ -624,7 +820,17 @@ def enrich_lead(lead: Lead) -> Lead:
                             if contact_url and contact_url not in urls_to_check:
                                 contact_html = _fetch(contact_url, timeout=10)
                                 if contact_html:
-                                    lead.email = _extract_emails_from_html(contact_html)
+                                    # Check mailto: links on contact page
+                                    contact_soup = BeautifulSoup(contact_html, "lxml")
+                                    mailto_links = contact_soup.select("a[href^='mailto:']")
+                                    for ml in mailto_links:
+                                        href = ml.get("href", "")
+                                        addr = href.replace("mailto:", "").split("?")[0].strip()
+                                        if addr and "@" in addr and not any(g in addr.lower() for g in {"noreply", "no-reply", "sentry"}):
+                                            lead.email = addr
+                                            break
+                                    if not lead.email:
+                                        lead.email = _extract_emails_from_html(contact_html)
                                     if lead.email:
                                         break
                     except:
@@ -653,6 +859,26 @@ def enrich_lead(lead: Lead) -> Lead:
 
         except Exception as e:
             print(f"  [Leads] Enrichment error for {lead.name} on {url}: {e}")
+
+    # If still no email but we have a website, try common email patterns
+    # (e.g. founder@company.com, contact@company.com, info@company.com)
+    if not lead.email and lead.website and lead.website.startswith("http"):
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(lead.website).netloc.replace("www.", "")
+            # Don't guess emails for github.com, vercel.app, etc.
+            skip_domains = {"github.com", "vercel.app", "netlify.app", "herokuapp.com",
+                           "gitlab.io", "github.io", "pages.dev", "fly.dev"}
+            if domain and not any(domain.endswith(s) for s in skip_domains):
+                # Try common business email patterns
+                common_prefixes = ["contact", "info", "hello", "founders", "team"]
+                for prefix in common_prefixes:
+                    candidate = f"{prefix}@{domain}"
+                    if not lead.email:
+                        lead.email = candidate  # Best guess — may bounce but worth trying
+                        break
+        except Exception:
+            pass
 
     # Determine best contact method — NO LinkedIn DMs
     # Priority: email > website_form > twitter_dm > manual
