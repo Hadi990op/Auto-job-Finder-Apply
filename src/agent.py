@@ -160,6 +160,10 @@ def init_db():
             use_headed_mode INTEGER DEFAULT 1,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS recently_viewed (
+            job_id TEXT PRIMARY KEY,
+            viewed_at TEXT
+        );
     """)
     db.execute("""
         INSERT OR IGNORE INTO agent_state (id, last_run, next_run, config)
@@ -368,11 +372,16 @@ def create_application(job_id: str, cv_text: str, cover_letter_text: str,
                        evaluation: EvaluationResult, source: str,
                        apply_method: str, apply_result: str) -> int:
     db = get_db()
+    # Determine honest status from apply_method
+    success_methods = ("email", "web_auto", "web_auto_greenhouse", "web_auto_lever",
+                       "web_auto_workable", "web_auto_linkedin", "web_auto_mustakbil",
+                       "web_auto_techjobs_pk", "web_auto_form", "linkedin_easy_apply", "recorded")
+    app_status = "applied" if apply_method.startswith(success_methods) else "apply_failed"
     cur = db.execute(
         "INSERT INTO applications (job_id, status, applied_date, source, apply_method, "
         "apply_result, cv_text, cover_letter_text, evaluation) "
-        "VALUES (?, 'applied', ?, ?, ?, ?, ?, ?, ?)",
-        (job_id, datetime.now().strftime("%Y-%m-%d %H:%M"), source,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (job_id, app_status, datetime.now().strftime("%Y-%m-%d %H:%M"), source,
          apply_method, apply_result, cv_text, cover_letter_text,
          json.dumps({
              "overall_score": evaluation.overall_score,

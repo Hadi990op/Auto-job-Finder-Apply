@@ -1180,6 +1180,47 @@ async def jobs_page(status: str = "", q: str = ""):
         else "<div class='alert'>No jobs found. Run the agent from the dashboard to discover jobs.</div>"
     )
 
+    # Recently viewed jobs section
+    recently_viewed_html = ""
+    try:
+        db = get_db()
+        recent = db.execute("""
+            SELECT j.id, j.title, j.company, j.location, j.fit_score, j.source, j.status, rv.viewed_at
+            FROM recently_viewed rv JOIN jobs j ON rv.job_id = j.id
+            ORDER BY rv.viewed_at DESC LIMIT 10
+        """).fetchall()
+        db.close()
+        if recent:
+            recent_cards = []
+            for r in recent:
+                r = dict(r)
+                score = r.get("fit_score", 0) or 0
+                if score >= 60: sc = "#10b981"
+                elif score >= 40: sc = "#3b82f6"
+                elif score >= 25: sc = "#f59e0b"
+                else: sc = "#ef4444"
+                src = r.get("source", "")
+                src_badge = f"<span style='color:#0a66c2;font-size:10px;font-weight:600'>LinkedIn</span>" if src == "linkedin" else f"<span style='color:#15a3f5;font-size:10px;font-weight:600'>Freelancer</span>" if src == "freelancer" else f"<span style='color:#64748b;font-size:10px;font-weight:600'>{src}</span>"
+                recent_cards.append(
+                    f"<a href='{BASE}/job/{r['id']}' style='display:flex;align-items:center;gap:10px;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:10px 14px;text-decoration:none;flex:1;min-width:250px;transition:.2s' "
+                    f"onmouseover=\"this.style.borderColor='#3b82f6'\" onmouseout=\"this.style.borderColor='#334155'\">"
+                    f"<div style='text-align:center;flex-shrink:0'><div style='font-size:18px;font-weight:800;color:{sc}'>{score:.0f}</div></div>"
+                    f"<div style='flex:1;min-width:0'>"
+                    f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:2px'>{src_badge}</div>"
+                    f"<div style='font-size:13px;font-weight:600;color:#f1f5f9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{r.get('title','N/A')}</div>"
+                    f"<div style='font-size:11px;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>{r.get('company','—')} · {r.get('location','—')}</div>"
+                    f"</div></a>"
+                )
+            recently_viewed_html = f"""
+<div style="margin-bottom:20px">
+<h2 style="font-size:16px;color:#cbd5e1;margin-bottom:10px">👁️ Recently Viewed</h2>
+<div style="display:flex;gap:10px;flex-wrap:wrap;overflow-x:auto">
+{"".join(recent_cards)}
+</div>
+</div>"""
+    except Exception as e:
+        print(f"  [App] Recently viewed error: {e}")
+
     extra_css = (
         ".job-card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:12px;transition:.2s}"
         ".job-card:hover{border-color:#3b82f6;box-shadow:0 4px 12px rgba(59,130,246,.1)}"
@@ -1320,6 +1361,8 @@ function submitBid() {{
 <a href="{BASE}/jobs?status=apply_failed" class="{f_failed}">Failed</a>
 <a href="{BASE}/jobs?status=apply_skipped" class="{f_skipped}">Skipped</a>
 </div>
+
+{recently_viewed_html}
 
 {jobs_or_empty}
 
@@ -1470,6 +1513,16 @@ async def job_detail_page(job_id: str):
     job = get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+
+    # Track recently viewed
+    try:
+        db = get_db()
+        db.execute("INSERT OR REPLACE INTO recently_viewed (job_id, viewed_at) VALUES (?, ?)",
+                   (job_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        db.commit()
+        db.close()
+    except:
+        pass
 
     profile = get_profile()
 
@@ -1652,17 +1705,25 @@ async def view_cover(job_id: str):
 async def applications_page():
     apps = get_applications()
 
+    # Stats summary
+    total = len(apps)
+    success_count = sum(1 for a in apps if a["status"] == "applied")
+    failed_count = sum(1 for a in apps if a["status"] == "apply_failed")
+    success_rate = round(success_count / total * 100) if total else 0
+
     rows_html = ""
     for a in apps:
-        status_colors = {"applied":"#93c5fd","interview":"#fcd34d","offer":"#6ee7b7","rejected":"#fca5a5","interested":"#94a3b8"}
+        status_colors = {"applied":"#6ee7b7","interview":"#fcd34d","offer":"#6ee7b7","rejected":"#fca5a5","interested":"#94a3b8","apply_failed":"#fca5a5"}
+        status_labels = {"applied":"✓ Applied","apply_failed":"✗ Failed","interview":"Interview","offer":"Offer","rejected":"Rejected","interested":"Interested"}
         sc = status_colors.get(a["status"], "#94a3b8")
+        sl = status_labels.get(a["status"], a["status"])
         rows_html += f"""
         <tr>
         <td><a href="{BASE}/application/{a['id']}">{a.get('job_title','N/A')}</a></td>
-        <td>{a.get('company','—')}</td>
-        <td>{a.get('location','—')}</td>
-        <td>{a.get('source','')}</td>
-        <td><span style="color:{sc};font-weight:bold">{a['status']}</span></td>
+        <td>{a.get('company') or '—'}</td>
+        <td>{a.get('location') or '—'}</td>
+        <td>{a.get('source') or ''}</td>
+        <td><span style="color:{sc};font-weight:bold">{sl}</span></td>
         <td>{(a.get('applied_date') or '—')[:10]}</td>
         <td><a href="{BASE}/application/{a['id']}" style="color:#60a5fa">View →</a></td>
         </tr>"""
@@ -1673,8 +1734,18 @@ async def applications_page():
 <style>{CSS}</style></head><body>
 {nav('apps')}
 <div class="container">
-<h1>Applications ({len(apps)})</h1>
+<h1>Applications ({total})</h1>
 <p class="subtitle">Jobs the agent has auto-applied to</p>
+{f'''<div style="display:flex;gap:12px;margin:16px 0;flex-wrap:wrap">
+<div style="background:#1e293b;padding:12px 20px;border-radius:8px;border-left:4px solid #60a5fa">
+<div style="font-size:24px;font-weight:bold">{total}</div><div style="color:#94a3b8;font-size:12px">Total</div></div>
+<div style="background:#1e293b;padding:12px 20px;border-radius:8px;border-left:4px solid #6ee7b7">
+<div style="font-size:24px;font-weight:bold;color:#6ee7b7">{success_count}</div><div style="color:#94a3b8;font-size:12px">Successfully Applied</div></div>
+<div style="background:#1e293b;padding:12px 20px;border-radius:8px;border-left:4px solid #fca5a5">
+<div style="font-size:24px;font-weight:bold;color:#fca5a5">{failed_count}</div><div style="color:#94a3b8;font-size:12px">Failed (needs manual)</div></div>
+<div style="background:#1e293b;padding:12px 20px;border-radius:8px;border-left:4px solid #fcd34d">
+<div style="font-size:24px;font-weight:bold;color:#fcd34d">{success_rate}%</div><div style="color:#94a3b8;font-size:12px">Success Rate</div></div>
+</div>''' if apps else ''}
 {"<table><tr><th>Title</th><th>Company</th><th>Location</th><th>Source</th><th>Status</th><th>Date</th><th></th></tr>" + rows_html + "</table>" if apps else '<div class="alert">No applications yet. The agent will auto-apply when you run it.</div>'}
 </div></body></html>"""
 
@@ -1691,7 +1762,7 @@ async def application_detail(app_id: int):
         raise HTTPException(404, "Application not found")
 
     a = dict(app_row)
-    statuses = ["applied", "interview", "offer", "rejected"]
+    statuses = ["applied", "apply_failed", "interview", "offer", "rejected"]
 
     # Check for proof screenshot
     screenshot_html = ""
