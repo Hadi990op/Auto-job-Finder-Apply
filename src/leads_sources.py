@@ -688,6 +688,120 @@ def scrape_hn_who_is_hiring(max_results: int = 20) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Source: Exa Web Search (via Agent-Reach / mcporter)
+# Finds companies actively hiring freelance/contract developers
+# ---------------------------------------------------------------------------
+
+def scrape_exa_search(max_results: int = 15, keywords: str = "saas platform") -> list:
+    """
+    Use Exa AI web search (via mcporter) to find companies hiring freelance/contract developers.
+    This is the highest-quality source — returns real job postings with company details.
+    """
+    leads = []
+    try:
+        import subprocess
+        # Build search queries based on user's keywords
+        queries = [
+            f"companies hiring freelance developer {keywords} 2026",
+            f"contract developer wanted {keywords} remote",
+            f"looking for freelance backend API developer startup",
+        ]
+
+        seen_urls = set()
+        for query in queries:
+            try:
+                result = subprocess.run(
+                    ["mcporter", "call", f"exa.web_search_exa(query: \"{query}\", numResults: {max_results})"],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode != 0 or not result.stdout:
+                    continue
+
+                # Parse the Exa output format (Title: ...\nURL: ...\n---)
+                blocks = result.stdout.split("---")
+                for block in blocks:
+                    block = block.strip()
+                    if not block:
+                        continue
+
+                    title = ""
+                    url = ""
+                    for line in block.split("\n"):
+                        line = line.strip()
+                        if line.startswith("Title:"):
+                            title = line[6:].strip()
+                        elif line.startswith("URL:"):
+                            url = line[4:].strip()
+
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+
+                    # Skip job boards we already scrape directly
+                    skip_domains = ["remoteok.com", "wellfound.com", "ycombinator.com",
+                                   "producthunt.com", "freelancer.com", "indeed.com",
+                                   "glassdoor.com", "linkedin.com/jobs", "stackoverflow.com/jobs"]
+                    if any(d in url.lower() for d in skip_domains):
+                        continue
+
+                    # Extract company name from title or URL
+                    company_name = title.split(" - ")[0].split(" | ")[0].split(" at ")[-1].strip() if title else ""
+                    if len(company_name) > 80:
+                        company_name = company_name[:80]
+
+                    lead = Lead(
+                        id=f"exa_{hash(url) % 10000000}",
+                        name=company_name or "Unknown",
+                        company=company_name or "Unknown",
+                        website=url,
+                        source="exa_search",
+                        source_url=url,
+                        description=title,
+                    )
+                    leads.append(lead)
+
+                    if len(leads) >= max_results:
+                        break
+                if len(leads) >= max_results:
+                    break
+            except subprocess.TimeoutExpired:
+                print(f"  [Leads] Exa search timed out for query: {query[:40]}")
+                continue
+            except Exception as e:
+                print(f"  [Leads] Exa search error: {e}")
+                continue
+
+    except ImportError:
+        print("  [Leads] mcporter not available for Exa search")
+    except Exception as e:
+        print(f"  [Leads] Exa search error: {e}")
+
+    print(f"  [Leads] Exa search: found {len(leads)} leads")
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# Enrichment helper: Jina Reader fallback
+# ---------------------------------------------------------------------------
+
+def _fetch_via_jina(url: str, timeout: int = 15) -> str:
+    """
+    Fallback: fetch a URL via Jina Reader API (https://r.jina.ai/URL).
+    Returns clean Markdown text — useful when direct fetch fails (403, bot detection, etc).
+    """
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        req = urllib.request.Request(jina_url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")[:200000]
+    except Exception as e:
+        print(f"  [Leads] Jina Reader fallback failed for {url}: {e}")
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Aggregate all sources
 # ---------------------------------------------------------------------------
 
@@ -700,6 +814,7 @@ def discover_all_leads(max_per_source: int = 30, keywords: str = "startup saas p
     seen_ids = set()
 
     sources = [
+        ("exa_search", lambda: scrape_exa_search(max_per_source, keywords)),
         ("github_homepages", lambda: scrape_github_with_homepages(max_per_source, keywords)),
         ("github", lambda: scrape_github_founders(20, keywords)),
         ("remoteok", lambda: scrape_job_boards_for_founders(max_per_source)),
@@ -783,6 +898,9 @@ def enrich_lead(lead: Lead) -> Lead:
         try:
             html = _fetch(url, timeout=15)
             if not html:
+                # Fallback: try Jina Reader (handles 403/bot-blocked sites)
+                html = _fetch_via_jina(url, timeout=15)
+            if not html:
                 continue
 
             soup = BeautifulSoup(html, "lxml")
@@ -819,6 +937,8 @@ def enrich_lead(lead: Lead) -> Lead:
                                 contact_url = urljoin(url, contact_url)
                             if contact_url and contact_url not in urls_to_check:
                                 contact_html = _fetch(contact_url, timeout=10)
+                                if not contact_html:
+                                    contact_html = _fetch_via_jina(contact_url, timeout=12)
                                 if contact_html:
                                     # Check mailto: links on contact page
                                     contact_soup = BeautifulSoup(contact_html, "lxml")
