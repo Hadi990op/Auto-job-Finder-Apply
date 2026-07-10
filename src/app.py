@@ -1663,7 +1663,7 @@ async def applications_page():
         <td>{a.get('location','—')}</td>
         <td>{a.get('source','')}</td>
         <td><span style="color:{sc};font-weight:bold">{a['status']}</span></td>
-        <td>{a.get('applied_date','—')[:10]}</td>
+        <td>{(a.get('applied_date') or '—')[:10]}</td>
         <td><a href="{BASE}/application/{a['id']}" style="color:#60a5fa">View →</a></td>
         </tr>"""
 
@@ -2185,7 +2185,7 @@ async def cv_page():
             <td><strong>{c.get('original_filename','—')}</strong> {prim_badge}</td>
             <td>{c.get('file_type','—')}</td>
             <td>{size_str}</td>
-            <td>{c.get('uploaded_at','')[:16]}</td>
+            <td>{(c.get('uploaded_at') or '')[:16]}</td>
             <td>
             <a href="{BASE}/api/cv/{c['id']}/download" class="btn btn-sec" style="font-size:11px;padding:4px 10px">⬇ Download</a>
             <a href="{BASE}/api/cv/{c['id']}/text" class="btn btn-sec" style="font-size:11px;padding:4px 10px">👁 View Text</a>
