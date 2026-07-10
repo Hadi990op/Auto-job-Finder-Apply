@@ -42,6 +42,20 @@ def generate_cv(profile: dict, job: dict, evaluation=None) -> str:
     company = job.get("company", "your company")
     years_exp = profile.get("years_experience", "")
 
+    # Try to use uploaded CV text as base if available
+    try:
+        from cv_manager import get_primary_cv
+        cv = get_primary_cv()
+        if cv and cv.get("text_content") and len(cv["text_content"]) > 100:
+            uploaded = cv["text_content"]
+            # If we have evaluation, add a tailored summary line
+            if evaluation and evaluation.matched_skills:
+                tailored_note = f"\n\n--- TAILORED FOR: {job_title} at {company} ---\nKey matching skills: {', '.join(evaluation.matched_skills[:5])}\n"
+                return uploaded + tailored_note
+            return uploaded
+    except Exception:
+        pass
+
     lines = []
 
     # Header

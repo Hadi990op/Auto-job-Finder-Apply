@@ -286,7 +286,42 @@ def ai_generate_cv(profile: dict, job: dict) -> str:
     job_title = job.get("title", "the position")
     company = job.get("company", "the company")
 
-    prompt = f"""You are an expert CV writer. Create a professional, well-structured CV in plain text format.
+    # Try to get the user's uploaded CV text to use as reference
+    uploaded_cv_text = ""
+    try:
+        from cv_manager import get_primary_cv
+        cv = get_primary_cv()
+        if cv and cv.get("text_content"):
+            uploaded_cv_text = cv["text_content"]
+    except Exception:
+        pass
+
+    if uploaded_cv_text:
+        prompt = f"""You are an expert CV writer. Create a professional, well-structured CV in plain text format.
+
+CANDIDATE'S ACTUAL RESUME (use this as the base — all facts, skills, education, and experience come from here):
+{uploaded_cv_text}
+
+---
+TARGET JOB:
+{job_ctx}
+
+---
+INSTRUCTIONS:
+1. Take the candidate's actual resume above as the BASE — do NOT invent experience, skills, or education that are not in it
+2. Tailor the CV for THIS specific job at {company}:
+   - Reorder and emphasize skills that match the job requirements
+   - Adjust the professional summary to highlight relevance to this role
+   - Keep all education and certifications from the original resume
+3. Do NOT inflate experience or add fake job titles — be honest about the candidate's actual background
+4. Use clean plain text format with clear section headers in CAPS
+5. Include: CONTACT INFO, PROFESSIONAL SUMMARY, SKILLS, EXPERIENCE (if any), EDUCATION, CERTIFICATIONS
+6. Do NOT include any preamble, explanation, or notes — just the CV itself
+7. Keep it professional and concise (maximum 80 lines)
+
+Generate the CV now:"""
+    else:
+        prompt = f"""You are an expert CV writer. Create a professional, well-structured CV in plain text format.
 
 {profile_ctx}
 
@@ -309,7 +344,7 @@ INSTRUCTIONS:
 Generate the CV now:"""
 
     result = _ai_chat_post([
-        {"role": "system", "content": "You are an expert CV writer. You create professional, tailored CVs in plain text. You read job descriptions carefully and tailor the CV to highlight relevant qualifications. Be concise and impactful. Output ONLY the CV, no explanations."},
+        {"role": "system", "content": "You are an expert CV writer. You create professional, tailored CVs in plain text. You read job descriptions carefully and tailor the CV to highlight relevant qualifications. Be honest — never invent experience or skills the candidate does not have. Be concise and impactful. Output ONLY the CV, no explanations."},
         {"role": "user", "content": prompt}
     ], timeout=90, retries=2)
 
